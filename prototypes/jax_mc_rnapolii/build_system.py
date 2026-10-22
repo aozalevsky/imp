@@ -13,9 +13,14 @@ Set IMP_TUTORIAL to a clone of https://github.com/salilab/imp_tutorial
     from build_system import build
     S = build(seed=1)
     S.m, S.root_hier, S.dof, S.mc1, S.outputobjects, S.rs (restraint set)
+
+The excluded-volume resolution (the tutorial's ExcludedVolumeSphere uses 10)
+can be changed with build(ev_resolution=1) or TUT_EV_RES=1 in the
+environment, for testing samplers on larger rigid bodies.
 """
 import os
 import random
+import re
 import sys
 import tempfile
 import types
@@ -46,7 +51,7 @@ def _record(cls, tag):
     cls._tut_recorded = True
 
 
-def build(seed=1, workdir=None, test=True, quiet=True):
+def build(seed=1, workdir=None, test=True, quiet=True, ev_resolution=None):
     import numpy as np
     import IMP
     import IMP.isd
@@ -65,6 +70,13 @@ def build(seed=1, workdir=None, test=True, quiet=True):
     src = open(script).read()
     assert src.count('mc1.execute_macro()') == 1
     src = src.replace('mc1.execute_macro()', '')
+    if ev_resolution is None:
+        ev_resolution = os.environ.get('TUT_EV_RES') or None
+    if ev_resolution is not None and float(ev_resolution) != 10.:
+        src, n = re.subn(r'(ExcludedVolumeSphere\(\s*included_objects='
+                         r'root_hier,\s*resolution=)10\)',
+                         r'\g<1>%g)' % float(ev_resolution), src)
+        assert n == 1
     cwd, argv = os.getcwd(), sys.argv
     os.chdir(os.path.join(workdir, 'modeling'))
     sys.argv = ['modeling.py'] + (['--test'] if test else [])
@@ -84,6 +96,7 @@ def build(seed=1, workdir=None, test=True, quiet=True):
         'm', 'root_hier', 'dof', 'mc1', 'outputobjects', 'num_mc_steps',
         'num_frames', 'gemt', 'xl1', 'xl2', 'ev')})
     S.workdir = workdir
+    S.ev_resolution = float(ev_resolution) if ev_resolution else 10.
     S.rs = IMP.pmi.tools.get_restraint_set(S.m)
     S.movers = S.dof.get_movers()
     return S

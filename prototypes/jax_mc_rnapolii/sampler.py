@@ -79,7 +79,8 @@ def _dist(a, b, xp):
 
 
 class TutSampler:
-    def __init__(self, s, dtype='float32', split=None, cache=None):
+    def __init__(self, s, dtype='float32', split=None, cache=None,
+                 grid=None, grid_h=6.0):
         """split: keep the static rows in one shared constant and score EV in
            a dynamic and a static pass (True, the GPU default), or keep
            every row in each chain's X with the 453 EV rows contiguous and
@@ -94,6 +95,9 @@ class TutSampler:
         gpu = jax.default_backend() != 'cpu'
         self.split = gpu if split is None else split
         self.cache = self.split and (True if cache is None else cache)
+        # static EV rows through a precomputed spatial grid (split + cache
+        # only): each query scores only the static rows that can touch it
+        self.grid = self.cache and (True if grid is None else grid)
         kind, ref = s.row_kind, s.row_ref
         ev = s.ev_rows
         is_ev = np.zeros(s.n, bool)
@@ -219,6 +223,63 @@ class TutSampler:
         m_ss = (np.triu(np.ones((len(rs), len(rs)), bool), 1)
                 & (lab[nde:, None] != lab[None, nde:]))
         self.ev_static_const = 0.5 * s.ev_k * float((x * x)[m_ss].sum())
+        if self.grid:
+            self._build_grid(grid_h)
+        # rows of each rigid body's cross-links, in body-local coordinates
+        for p in self.steps:
+            if p['kind'] == 'rb':
+                p['local_xa'] = self.local[p['xa']].T
+                o1, n1 = self.body_ev[p['body']]
+                # pairs inside the body cancel exactly (rigid motion)
+                p['evmask_dyn'] = p['evmask_dyn'].copy()
+                p['evmask_dyn'][:, o1:o1 + n1] = False
+
+    def _build_grid(self, h):
+        """Cell -> static EV rows within reach of any dynamic EV row in
+           the cell (padded with a dummy row far away, radius 0)"""
+        nse = self.n_se
+        S = self.static_xyz[:, :nse].T
+        R = self.r[self.se_off:self.se_off + nse]
+        rq = float(self.r[:self.n_de].max())
+        pad = rq + R.max() + h
+        lo = S.min(0) - pad
+        n = np.ceil((S.max(0) + pad - lo) / h).astype(np.int64)
+        ijk = np.stack(np.meshgrid(*[np.arange(k) for k in n],
+                                   indexing='ij'), -1).reshape(-1, 3)
+        cen = lo + h * (ijk + 0.5)
+        dd = np.maximum(np.abs(cen[:, None, :] - S[None]) - h / 2, 0.)
+        # 0.01 A margin: a float32 cell index may be off by one at a face
+        cand = np.sqrt((dd ** 2).sum(-1)) < rq + R[None] + 0.01
+        K = int(cand.sum(1).max())
+        table = np.full((len(cen) + 1, K), nse, np.int32)   # last: outside
+        for c in np.nonzero(cand.any(1))[0]:
+            j = np.nonzero(cand[c])[0]
+            table[c, :len(j)] = j
+        self.g_lo, self.g_h, self.g_n = lo, float(h), n
+        self.g_table = table
+        self.g_S = np.vstack([S, [1e4, 1e4, 1e4]]).T          # (3, nse+1)
+        self.g_R = np.r_[R, 0.]
+        self.g_K = K
+
+    def _static_ev_grid(self, xq, rq):
+        """sum over static EV rows of soft(|xq - S|, rq + R) for query
+           rows xq (3, m) with radii rq (m,) -> (m,)"""
+        import jax.numpy as jnp
+        dt = xq.dtype
+        n = self.g_n
+        idx = jnp.floor((xq - jnp.asarray(self.g_lo, dt)[:, None])
+                        / self.g_h)
+        idx = jnp.clip(idx, -1, jnp.asarray(n, dt)[:, None]).astype(
+            jnp.int32)
+        inside = jnp.all((idx >= 0) & (idx < jnp.asarray(n)[:, None]
+                                       .astype(jnp.int32)), axis=0)
+        flat = (idx[0] * int(n[1]) + idx[1]) * int(n[2]) + idx[2]
+        flat = jnp.where(inside, flat, len(self.g_table) - 1)
+        cand = jnp.asarray(self.g_table)[flat]                  # (m, K)
+        Sc = jnp.asarray(self.g_S, dt)[:, cand]                 # (3, m, K)
+        Rc = jnp.asarray(self.g_R, dt)[cand]
+        d = _dist(Sc, xq[:, :, None], jnp)
+        return jnp.sum(self._soft(d, rq[:, None] + Rc), axis=1)
 
     # ------------------------------------------------------------------
     def _static(self, X):
@@ -316,13 +377,16 @@ class TutSampler:
                             jnp.asarray(s.xl_psi[xi], dt), s.xl_length,
                             s.xl_slope, jnp)
 
-    def _em(self, X, quat):
-        """EM term from the model Gaussians in the bodies' blocks of X"""
+    def _em(self, X, quat, moved=None):
+        """EM term from the model Gaussians in the bodies' blocks of X;
+           moved=(b, Xb2): body b's rows from its new 'other' block"""
         import jax.numpy as jnp
         s = self.s
         dt = X.dtype
-        xm = jnp.concatenate([X[:, o:o + n] for o, n in self.em_slices],
-                             axis=1)
+        xm = jnp.concatenate(
+            [moved[1][:, :n] if moved is not None and b == moved[0]
+             else X[:, o:o + n] for b, (o, n) in enumerate(self.em_slices)],
+            axis=1)
         if s.cov_mode == 'frozen':
             cm = jnp.asarray(self.em_cov_frozen, dt)
         else:
@@ -448,9 +512,12 @@ class TutSampler:
             e = jnp.where(jnp.asarray(p['evmask_dyn']),
                           self._soft(_dist(Xd, xn[:, None], jnp), rr)
                           - self._soft(_dist(Xd, xo[:, None], jnp), rr), 0.)
-            Ss = self._static(X)[:, :nse]
-            rs = r[rk] + r[self.se_off:self.se_off + nse]
-            es_n = jnp.sum(self._soft(_dist(Ss, xn[:, None], jnp), rs))
+            if self.grid:
+                es_n = self._static_ev_grid(xn[:, None], r[rk][None])[0]
+            else:
+                Ss = self._static(X)[:, :nse]
+                rs = r[rk] + r[self.se_off:self.se_off + nse]
+                es_n = jnp.sum(self._soft(_dist(Ss, xn[:, None], jnp), rs))
             es_o = (st.es_bead[k] if self.cache else
                     jnp.sum(self._soft(_dist(Ss, xo[:, None], jnp), rs)))
             de = 0.5 * s.ev_k * (jnp.sum(e) + es_n - es_o)
@@ -499,13 +566,13 @@ class TutSampler:
         (o1, n1), (o2, n2) = self.body_ev[b], self.body_ot[b]
         Xb1 = Rn @ jnp.asarray(p['local_ev'], dt) + tn[:, None]
         Xb2 = Rn @ jnp.asarray(p['local_ot'], dt) + tn[:, None]
-        Xn = jax.lax.dynamic_update_slice(X, Xb1, (0, o1))
-        Xn = jax.lax.dynamic_update_slice(Xn, Xb2, (0, o2))
         nde, nse = self.n_de, self.n_se
         Xo1 = X[:, o1:o1 + n1]
         rm = r[o1:o1 + n1, None]
         if not self.split:
             # EV: the body's EV rows vs all 453 (other labels), one pass
+            Xn = jax.lax.dynamic_update_slice(X, Xb1, (0, o1))
+            Xn = jax.lax.dynamic_update_slice(Xn, Xb2, (0, o2))
             ne = self.n_ev
             rr = rm + r[None, :ne]
             e = jnp.where(jnp.asarray(p['evmask_all']),
@@ -515,18 +582,22 @@ class TutSampler:
                                              X[:, None, :ne], jnp), rr), 0.)
             de = 0.5 * s.ev_k * jnp.sum(e)
         else:
-            # EV vs the dynamic EV rows (other labels) ...
+            # EV vs the dynamic EV rows of other bodies and beads (the
+            # body's own rows are masked, so X serves for old and new) ...
             rr = rm + r[None, :nde]
+            Xd = X[:, None, :nde]
             e = jnp.where(jnp.asarray(p['evmask_dyn']),
-                          self._soft(_dist(Xb1[:, :, None],
-                                           Xn[:, None, :nde], jnp), rr)
-                          - self._soft(_dist(Xo1[:, :, None],
-                                             X[:, None, :nde], jnp), rr),
+                          self._soft(_dist(Xb1[:, :, None], Xd, jnp), rr)
+                          - self._soft(_dist(Xo1[:, :, None], Xd, jnp), rr),
                           0.)
             # ... and the static ones (all other labels)
-            Ss = self._static(X)[:, None, :nse]
-            rs = rm + r[None, self.se_off:self.se_off + nse]
-            es_n = jnp.sum(self._soft(_dist(Xb1[:, :, None], Ss, jnp), rs))
+            if self.grid:
+                es_n = jnp.sum(self._static_ev_grid(Xb1, r[o1:o1 + n1]))
+            else:
+                Ss = self._static(X)[:, None, :nse]
+                rs = rm + r[None, self.se_off:self.se_off + nse]
+                es_n = jnp.sum(self._soft(_dist(Xb1[:, :, None], Ss, jnp),
+                                          rs))
             es_o = (st.es_body[b] if self.cache else
                     jnp.sum(self._soft(_dist(Xo1[:, :, None], Ss, jnp),
                                        rs)))
@@ -534,11 +605,12 @@ class TutSampler:
         if len(p['xi']):
             xa, xb = p['xa'], p['xb']
             xother = self.take(X, xb)
+            xa_new = Rn @ jnp.asarray(p['local_xa'], dt) + tn[:, None]
             de += jnp.sum(
-                self._xl_terms(_dist(Xn[:, xa], xother, jnp), p['xi'])
+                self._xl_terms(_dist(xa_new, xother, jnp), p['xi'])
                 - self._xl_terms(_dist(X[:, xa], xother, jnp), p['xi']))
         quat_n = st.quat.at[b].set(qn)
-        em_n = self._em(Xn, quat_n)
+        em_n = self._em(X, quat_n, moved=(b, Xb2))
         de += em_n - st.em
         acc = (de <= 0) | (uni[i, 1] < jnp.exp(-de / st.kT))
         # write back only the body's two blocks (in place)

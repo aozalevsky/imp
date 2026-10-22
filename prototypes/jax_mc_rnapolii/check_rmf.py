@@ -1,10 +1,12 @@
-"""Rescore frames of a run_chains.py output with C++ IMP: load each RMF
+"""Rescore frames of a run_chains.py output, or of a run_soa.py rank
+directory after dofs_to_rmf.py --per-chain, with C++ IMP: load each RMF
 frame into the tutorial model, refresh the model Gaussians' covariances
 (--cov rotate runs), evaluate the restraint set and compare with the score
 the JAX run recorded. C++ EM uses its own close-pair lists, so the EM term
 is also recomputed with scoring.py on those lists to separate that effect.
 
     python check_rmf.py runs/x [--chains 0 1 2] [--frames 4]
+    python check_rmf.py runs/soa/rank0
 """
 import argparse
 import json
@@ -28,7 +30,7 @@ def main():
     a = ap.parse_args()
     summ = json.load(open(os.path.join(a.run, 'summary.json')))
     scores = np.load(os.path.join(a.run, 'scores.npy'))
-    S = build(seed=1)
+    S = build(seed=1, ev_resolution=summ.get('ev_res'))
     s = T.TutSystem(S, cov_mode=summ['cov'])
     worst = 0.
     for c in a.chains:
