@@ -12,6 +12,16 @@ are listed under [Toward IMP](#toward-imp).
 per GPU at 16,384–32,768 chains; see
 [Faster sampler](#faster-sampler-run_soapy).
 
+**Update (2026-10-22):** a proof of concept, `fused_kernel/`, runs a whole
+sweep as one hand-written GPU kernel (Pallas/Triton). At 16,384 chains per
+GPU on four L40s, complete runs with output go 1.76 times as fast as
+`run_soa.py` with the same settings (3.63 against 2.07 billion MC steps/s).
+With `--rescore recorded` and a cache for the EM term they reach 4.19
+billion, 1.6 times `run_soa.py`'s complete runs at 32,768 chains per GPU
+(2.58 billion, a rescore every frame). Score statistics agree with
+`run_soa.py`'s. It is not meant to be maintained; see
+[fused_kernel/README.md](fused_kernel/README.md).
+
 **"Exact" here means:**
 * the same scoring function and the same moves as the C++ run;
 * every term agrees with C++ to float64 round-off (see
@@ -126,6 +136,11 @@ commit ca01dbfce5. All the changes are exact:
   drift statistics, the scores and each frame's 10 best configurations. The
   next block is dispatched before the previous block's records are read, so
   the host's work overlaps with sampling.
+  * `--rescore recorded` does the full rescore only on the frames whose
+    scores are recorded (every `--score-every`th). The other frames keep
+    the sampler's tracked energies: their entries in `drift.npy` are NaN,
+    and `best.npz` ranks them by tracked energy. The default,
+    `--rescore every`, rescores every frame, as `run_mpi.py` does.
 * **Output as snapshots of the sampled degrees of freedom**: rigid-body
   quaternions and translations, and bead positions, 620 bytes per chain per
   snapshot. They are written by a background thread. `dofs_to_rmf.py` makes
@@ -312,6 +327,7 @@ production loop with a full rescore every frame:
 | `ensemble.py` | C++ against JAX score distributions |
 | `compare_final.py` | final results of complete C++ and JAX runs |
 | `bench_chains.py` | throughput against the number of chains |
+| `fused_kernel/` | proof of concept: the whole sweep as one Pallas (Triton) kernel, with its own README |
 
 ## Running
 
@@ -337,6 +353,10 @@ python dofs_to_rmf.py runs/soa4 --best 1000 --procs 8
 python verify.py --out ref.npz --x64 --grid 0
 python verify.py --out f32.npz --soa
 python verify.py --compare ref.npz f32.npz
+# the fused-kernel proof of concept (NVIDIA GPUs)
+cd fused_kernel
+python test_fused.py --check --chains 4096
+mpirun -np 4 --bind-to none python run_soa_fused.py --chains 16384 --frames 20000 --thin 200 --score-every 10 --rescore recorded --out runs/fused
 ```
 
 ## Relation to IMP's JAX path
@@ -368,7 +388,8 @@ restraint (`PairsRestraint` over a `ClosePairContainer` with
 * **The cross-link forward model** is the one IMP currently computes
   (salilab/imp#1120). If salilab/imp#1123 is merged, `xl_neglogp()` in
   `scoring.py` needs the same change.
-* **float32 by default**, on CPU and GPU, with a full rescore every frame.
+* **float32 by default**, on CPU and GPU, with a full rescore every frame
+  (`run_soa.py --rescore recorded`: every recorded frame).
   float64 works on both (`--dtype float64`).
 * **TF32 in `sampler.py` on a GPU.** `TutSampler` (`run_chains.py`,
   `run_mpi.py`) rotates rigid bodies and EM covariances with matrix

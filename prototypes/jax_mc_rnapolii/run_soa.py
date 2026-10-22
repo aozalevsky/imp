@@ -3,12 +3,13 @@ sampler, the device kept busy: frames run in blocks inside one jitted call,
 and the output is the sampled degrees of freedom, not RMF.
 
     mpirun -np R python run_soa.py --chains B --frames F [--block 20] \\
-        [--thin T] [--score-every K] --out runs/x
+        [--thin T] [--score-every K] [--rescore recorded] --out runs/x
     python dofs_to_rmf.py runs/x ...       # RMF for the frames you need
 
 Same protocol as run_mpi.py --mode independent (R x B independent copies of
 the tutorial's run with PMI's annealing schedule; per frame 10 sweeps and a
-full rescore), but:
+full rescore; with --rescore recorded only the recorded frames are
+rescored), but:
 
 * --block frames run in one device call (lax.scan): the per-frame rescore,
   the drift statistics, the scores and each frame's 10 best configurations
@@ -32,10 +33,12 @@ OUT/ev_select/.
 Outputs in OUT/rank<r>/:
   scores.npy (frames // K, B, 6): E, kT, conn, EV, XL, EM of frames K-1,
       2K-1, ...;
-  drift.npy (frames, 2): max and median |tracked - rescored| per frame;
+  drift.npy (frames, 2): max and median |tracked - rescored| per frame
+      (NaN on frames that are not rescored);
   dofs_quat.npy (S, B, nb, 4), dofs_trans.npy (S, B, nb, 3),
       dofs_bead.npy (S, B, nbead, 3), dofs_frames.npy (S,) frame numbers;
-  best.npz: the 10 best-scoring configurations over all frames and chains;
+  best.npz: the 10 best-scoring configurations over all frames and chains
+      (by tracked energies on frames that are not rescored);
   summary.json; and OUT/summary.json (rank 0) with the totals.
 """
 import argparse
@@ -51,27 +54,52 @@ from run_chains import sa_temperature
 from run_mpi import rank_info
 
 
-def make_block(smp, sweeps=10, top=10):
-    """jitted f(state, kTs (F,)) -> state, per-frame records"""
+def make_block(smp, sweeps=10, top=10, rescore_every=1):
+    """jitted f(state, kTs (F,)) -> state, per-frame records. With
+       rescore_every K > 1 only every K-th frame is rescored; the others
+       record the sampler's tracked energies, NaN terms and NaN drift."""
     import jax
     import jax.numpy as jnp
     o, nbead = smp.bead_off, smp.s.nbead
+    K = rescore_every
+
+    def sample(st, kT):
+        st.kT = jnp.full_like(st.kT, kT)
+        return jax.lax.fori_loop(0, sweeps, lambda _, x: smp._sweep(x), st)
+
+    def best_of(st, e):
+        neg, idx = jax.lax.top_k(-e, top)
+        return (idx, -neg, st.quat[:, :, idx], st.trans[:, :, idx],
+                st.X[:, o:o + nbead, idx])
 
     def frame(st, kT):
-        st.kT = jnp.full_like(st.kT, kT)
-        st = jax.lax.fori_loop(0, sweeps, lambda _, x: smp._sweep(x), st)
+        st = sample(st, kT)
         e_track = st.energy
         e, em, tr, eb, ebody = smp._full(st.X, st.quat) \
             + smp._static_ev(st.X)
         st.energy, st.em, st.es_bead, st.es_body = e, em, eb, ebody
         dd = jnp.abs(e_track - e)
-        neg, idx = jax.lax.top_k(-e, top)
-        best = (idx, -neg, st.quat[:, :, idx], st.trans[:, :, idx],
-                st.X[:, o:o + nbead, idx])
-        return st, (e, tr, jnp.max(dd), jnp.median(dd), best)
+        return st, (e, tr, jnp.max(dd), jnp.median(dd), best_of(st, e))
+
+    def frame_tracked(st, kT):
+        st = sample(st, kT)
+        e = st.energy
+        nan = jnp.array(jnp.nan, e.dtype)
+        tr = jnp.full(e.shape + (4,), jnp.nan, e.dtype)
+        return st, (e, tr, nan, nan, best_of(st, e))
+
+    def group(st, kTs):
+        st, r1 = jax.lax.scan(frame_tracked, st, kTs[:-1])
+        st, r2 = frame(st, kTs[-1])
+        return st, jax.tree.map(
+            lambda a, b: jnp.concatenate([a, b[None]]), r1, r2)
 
     def block(st, kTs):
-        return jax.lax.scan(frame, st, kTs)
+        if K == 1:
+            return jax.lax.scan(frame, st, kTs)
+        st, rec = jax.lax.scan(group, st, kTs.reshape(-1, K))
+        return st, jax.tree.map(
+            lambda a: a.reshape((-1,) + a.shape[2:]), rec)
     return jax.jit(block, donate_argnums=0)
 
 
@@ -143,6 +171,12 @@ def main():
     ap.add_argument('--tune-cache', default=os.path.expanduser(
         '~/.cache/jax_mc_rnapolii/ev_select.json'),
         help='where --ev auto remembers its trials ("" for none)')
+    ap.add_argument('--rescore', default='every',
+                    choices=['every', 'recorded'],
+                    help='full rescore of every frame (as run_mpi.py), or '
+                         'only of the frames whose scores are recorded '
+                         '(every --score-every-th); the others keep the '
+                         "sampler's tracked energies")
     ap.add_argument('--ev-res', type=float, default=None,
                     help='resolution of the excluded volume (tutorial: 10)')
     ap.add_argument('--out', required=True)
@@ -162,6 +196,10 @@ def main():
     if a.frames % F or F % K and K % F:
         raise SystemExit('--frames must be a multiple of the block, and '
                          'the block and --score-every divide one another')
+    RS = K if a.rescore == 'recorded' else 1
+    if F % RS:
+        raise SystemExit('--rescore recorded needs a block that is a '
+                         'multiple of --score-every')
     log = open(os.path.join(out, 'run.log'), 'a')
 
     def say(*x, all_ranks=False):
@@ -191,7 +229,8 @@ def main():
     t_setup = time.time() - t0
     kT1 = jnp.ones(F, smp.dt)
     smp, block, ev_info = ev_select.select(
-        smp, st, kT1, lambda v: make_block(v).lower(st, kT1).compile(),
+        smp, st, kT1,
+        lambda v: make_block(v, rescore_every=RS).lower(st, kT1).compile(),
         mode=a.ev, cache=a.tune_cache or None, rank=rank, size=size,
         share=os.path.join(os.path.abspath(a.out), 'ev_select'), say=say)
     snap = jax.jit(lambda st: (st.quat, st.trans, st.X[:, o:o + nbead])) \
@@ -273,13 +312,13 @@ def main():
     res = dict(rank=rank, size=size, local_rank=local, gpu=gpu,
                device=str(jax.devices()[0]), chains=B, frames=a.frames,
                block=F, thin=a.thin, cov=a.cov, score_every=K,
-               ev_res=S.ev_resolution, ev=ev_info,
+               ev_res=S.ev_resolution, ev=ev_info, rescore=a.rescore,
                steps=int(steps), setup_s=t_setup, compile_s=t_compile,
                sample_s=t_sample, total_s=t_total,
                mc_steps_per_s=steps / t_total,
                snapshot_writer_busy_s=writer.busy if writer else 0.,
-               drift_max=float(drift[:, 0].max()),
-               drift_median=float(np.median(drift[:, 1])),
+               drift_max=float(np.nanmax(drift[:, 0])),
+               drift_median=float(np.nanmedian(drift[:, 1])),
                acceptance_beads=float(acc[[i for i, p in
                                            enumerate(smp.steps)
                                            if p['kind'] == 'bead']].mean()),
@@ -303,7 +342,7 @@ def main():
         wall = max(x['total_s'] for x in R)
         merged = dict(ranks=size, chains_per_rank=B, frames=a.frames,
                       block=F, thin=a.thin, score_every=K, steps=tot,
-                      ev_res=S.ev_resolution,
+                      ev_res=S.ev_resolution, rescore=a.rescore,
                       ev_mode=[x['ev']['mode'] for x in R],
                       mc_steps_per_s_aggregate=tot / wall, total_s_max=wall,
                       per_rank=[{k: x[k] for k in (

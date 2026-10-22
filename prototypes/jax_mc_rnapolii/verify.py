@@ -6,15 +6,15 @@ for comparing sampler variants against a float64 dense reference.
     python verify.py --compare ref.npz f32.npz ...
 
 The first call equilibrates --chains chains and saves them to --states
-(one file per EV resolution by default); later calls reuse them. --normalize renormalizes the saved float32
-quaternions in float64, which --body-grid needs for a float64 check (the
-per-body grids invert a body's frame with R^T). TUT_EV_RES=1 in the
+(one file per EV resolution by default); later calls reuse them.
+--normalize renormalizes the saved float32 quaternions in float64, which
+--body-grid needs for a float64 check (the per-body grids invert a body's
+frame with R^T). TUT_EV_RES=1 in the
 environment checks the tutorial with EV at resolution 1.
 """
 import argparse
 import dataclasses
 import os
-import sys
 
 import numpy as np
 
@@ -76,9 +76,9 @@ def compare(paths):
             sel = kinds == kind
             err = np.abs(d['dE'][:, sel] - ref['dE'][:, sel])
             acc = (d['dE'] <= 0) | (u < np.exp(-np.clip(d['dE'], 0, 700)))
+            flip = 100 * (acc != acc_r)[:, sel].mean()
             print('  %-4s dE err median %.2e max %.2e; decisions flipped '
-                  '%.4f%%' % (kind, np.median(err), err.max(),
-                             100 * (acc != acc_r)[:, sel].mean()))
+                  '%.4f%%' % (kind, np.median(err), err.max(), flip))
         e = np.abs(d['E'] - ref['E'])
         print('  full energy err median %.2e max %.2e' % (np.median(e),
                                                           e.max()))
