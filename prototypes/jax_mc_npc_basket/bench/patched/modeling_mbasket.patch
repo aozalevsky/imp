@@ -1,0 +1,46 @@
+--- Mouse_NPC_Basket/src/modeling_mbasket.py	2026-10-12 07:43:57.481748339 -0700
++++ bench/patched/Mouse_src/modeling_mbasket.py	2026-10-12 08:51:01.216724006 -0700
+@@ -35,6 +35,7 @@
+ # --------------------------------------------------------------
+ 
+ import time
++import matplotlib
+ import matplotlib.pyplot as plt
+ import matplotlib.cm as cm
+ import operator
+@@ -187,6 +188,11 @@
+ 		'muNup133':['G','R'],'muNup43':['J','X'],'muNup37':['K','Y']}
+ 
+ EV_RESOLUTION=30
++# Optional: slack (A) of the excluded-volume close-pair list. None keeps the
++# PMI default (10 A). 30 A made REX2 ~10-20% faster in benchmarks; energies
++# stay exact, but trajectories are not bit-identical to the published runs
++# (EV terms get summed in a different order under score_moved).
++EV_SLACK = None
+ INIT_TRANS = 500.0
+ 
+ # rigid body/beads params
+@@ -266,9 +272,10 @@
+ # -----------------------------------------
+ 
+ #Color map iterator in the Chimera format
+-Rcolor1 = cm.get_cmap('Set3', 12) #No of colors in Set3 = 12
+-Rcolor2 = cm.get_cmap('Pastel1', 8) #No of colors in Set2 = 8
+-Rcolor3 = cm.get_cmap('tab20', 20) #No of colors in Set2 = 8
++# matplotlib.cm.get_cmap was removed in matplotlib 3.9; same colors
++Rcolor1 = matplotlib.colormaps['Set3'].resampled(12) #No of colors in Set3 = 12
++Rcolor2 = matplotlib.colormaps['Pastel1'].resampled(8) #No of colors in Set2 = 8
++Rcolor3 = matplotlib.colormaps['tab20'].resampled(20) #No of colors in Set2 = 8
+ 
+ Rcolors = iter(np.vstack(( Rcolor1(np.linspace(0,1,12))[:,0:3], Rcolor2(np.linspace(0,1,8))[:,0:3], Rcolor3(np.linspace(0,1,20))[:,0:3] )) )
+ 
+@@ -1137,6 +1144,9 @@
+ evr1 = IMP.pmi.restraints.stereochemistry.ExcludedVolumeSphere(
+ 	included_objects=SPOKE_1_MOLS_BSKT_MU,
+ 	resolution=EV_RESOLUTION)
++if EV_SLACK is not None:
++	# evr2 below is bipartite; its CloseBipartitePairContainer has no set_slack
++	evr1.cpc.set_slack(EV_SLACK)
+ evr1.add_to_model()
+ output_objects.append(evr1)
+ 

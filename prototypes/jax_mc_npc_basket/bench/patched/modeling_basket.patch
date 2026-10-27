@@ -1,0 +1,43 @@
+--- Yeast_NPC_Basket/src/modeling_basket.py	2026-10-12 07:43:57.689777143 -0700
++++ bench/patched/Yeast_src/modeling_basket.py	2026-10-12 08:51:01.216171196 -0700
+@@ -35,6 +35,7 @@
+ import sys
+ import os
+ import math
++import matplotlib
+ import matplotlib.pyplot as plt
+ import matplotlib.cm as cm
+ import numpy as np
+@@ -141,6 +142,11 @@
+ 
+ 
+ EV_RESOLUTION=30
++# Optional: slack (A) of the excluded-volume close-pair list. None keeps the
++# PMI default (10 A). 30 A made REX2 ~10-20% faster in benchmarks; energies
++# stay exact, but trajectories are not bit-identical to the published runs
++# (EV terms get summed in a different order under score_moved).
++EV_SLACK = None
+ INIT_TRANS = 500.0
+ 
+ # rigid body/beads params
+@@ -238,8 +244,9 @@
+ nup60_seqs = IMP.pmi.topology.Sequences(nup60_fastafile)
+ 
+ #Color map iterator in the Chimera format
+-Rcolor1 = cm.get_cmap('Set3', 12) #No of colors in Set3 = 12
+-Rcolor2 = cm.get_cmap('Pastel1', 8) #No of colors in Set2 = 8
++# matplotlib.cm.get_cmap was removed in matplotlib 3.9; same colors
++Rcolor1 = matplotlib.colormaps['Set3'].resampled(12) #No of colors in Set3 = 12
++Rcolor2 = matplotlib.colormaps['Pastel1'].resampled(8) #No of colors in Set2 = 8
+ Rcolors = iter(np.vstack((Rcolor1(np.linspace(0,1,12))[:,0:3],Rcolor2(np.linspace(0,1,8))[:,0:3])))
+ 
+ 
+@@ -1252,6 +1259,8 @@
+ evr0 = IMP.pmi.restraints.stereochemistry.ExcludedVolumeSphere(
+ 	included_objects=SPOKE_1_MOLS,
+ 	resolution=EV_RESOLUTION)
++if EV_SLACK is not None:
++	evr0.cpc.set_slack(EV_SLACK)
+ evr0.add_to_model()
+ output_objects.append(evr0)
+ 
