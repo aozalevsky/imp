@@ -8,6 +8,7 @@ data Gaussian). Prints the C++ score before/after the rotation, the score
 after clearing the Model's caches, and what the cached global covariance
 holds. Runs on any IMP with IMP.bayesianem (2.18, 2.25, nightly)."""
 import math
+import sys
 
 import IMP
 import IMP.algebra
@@ -44,7 +45,6 @@ IMP.atom.Mass.setup_particle(anchor, 1000.)
 body = IMP.atom.create_rigid_body([model_g, anchor])
 
 sigma = IMP.isd.Scale.setup_particle(IMP.Particle(m, 'sigma'), 1.0)
-import sys
 if 'isd' in sys.argv:
     print('restraint: IMP.isd.GaussianEMRestraint')
     r = IMP.isd.GaussianEMRestraint(

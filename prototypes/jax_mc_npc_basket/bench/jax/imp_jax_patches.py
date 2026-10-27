@@ -309,7 +309,8 @@ def _xl_arrays(restraints):
     pis, sig, psi, rid = [], [], [], []
     for i, r in enumerate(restraints):
         for k in range(r.get_number_of_contributions()):
-            pis.append([int(x) for x in r.get_contribution_particle_indexes(k)])
+            pis.append([int(x) for x in
+                        r.get_contribution_particle_indexes(k)])
             sig.append([int(x) for x in r.get_contribution_sigma_indexes(k)])
             psi.append(int(r.get_contribution_psi_index(k)))
             rid.append(i)
@@ -371,7 +372,7 @@ def _make_xl_prob_func(restraints, space):
         if slope is not None:
             term = term * jnp.exp(-slope * dist)
         if single:
-            # one contribution per restraint (the usual PMI case): no segment op
+            # one contribution per restraint (usual in PMI): no segment op
             onemprob = 1.0 - term
         else:
             onemprob = jax.ops.segment_prod(1.0 - term, rid,

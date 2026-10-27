@@ -2,8 +2,8 @@
 # checkpoint/restart tests of run_npc_jax.py on CPU (small system)
 [ -n "$ENV_SH" ] && source "$ENV_SH"   # optional: environment (IMP, JAX venv)
 export JAX_PLATFORMS=cpu
-cd "${NPC:?set NPC to the NPC_Basket clone that has bench/}/bench/jax"
 T=$(cd "$(dirname "$0")" && pwd); R=$T/runs; mkdir -p $R
+cd "${NPC:?set NPC to the NPC_Basket clone that has bench/}/bench/jax"
 RUN="nice -n 10 python -u -W ignore run_npc_jax.py yeast --chains 8 --rex 2 --thin 2 --check-every 3 --seed 3"
 wait_lines() {   # file n pid: until file has n lines (or pid exits)
   while kill -0 $3 2>/dev/null; do

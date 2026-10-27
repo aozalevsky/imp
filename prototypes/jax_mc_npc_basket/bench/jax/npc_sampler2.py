@@ -561,7 +561,7 @@ class NPCSampler2:
                 for c in lst:
                     for r_ in x['crow'][c]:
                         x['rowres'].setdefault(int(r_), set()).add(ri_)
-            x['cmax'] = max(len(l) for l in x['rcon'])
+            x['cmax'] = max(len(rc) for rc in x['rcon'])
             x['nres'] = len(x['rcon'])
 
         for sp in specs:
@@ -1118,8 +1118,8 @@ class NPCSampler2:
                 lambda i, s: step(s, (i0 + i) % nmov, U[i], Z[i]), s)
 
         def run_batched(sb, nsteps):
-            sb.rkey, U, Z = jax.vmap(draws, in_axes=(0, None))(sb.rkey,
-                                                                 nsteps)
+            sb.rkey, U, Z = jax.vmap(draws, in_axes=(0, None))(
+                sb.rkey, nsteps)
             i0 = sb.imov[0] + 1
             vstep = jax.vmap(step, in_axes=(0, None, 0, 0))
             return jax.lax.fori_loop(

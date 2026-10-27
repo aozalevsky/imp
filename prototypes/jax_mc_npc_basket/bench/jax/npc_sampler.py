@@ -454,7 +454,6 @@ class NPCSampler:
         # particles, centroid weights, moved EV/EM sets (+ EM body slot)
         tr_bodies = _pad([[body_index[b] for b in bs] for bs, _ in tr_specs]
                          or [[]], nb)
-        kb = tr_bodies.shape[1]
         tr_xyz = _pad([table[np.asarray(xs, np.int64)] for _, xs in tr_specs]
                       or [[]], SINK)
         tr_wb = np.where(tr_bodies < nb, bnmem[tr_bodies], 0.)
@@ -513,7 +512,6 @@ class NPCSampler:
         EV = [dict(rows=i32(e['rows']), r=f(e['r']),
                    label=jnp.asarray(e['label']), body=i32(e['body']),
                    ball=i32(e['ball']), tr=i32(e['tr'])) for e in evt]
-        n_evt = len(evt)
         import IMP.jax
         leaf_fns = []
         for w, d in leaves:
@@ -712,7 +710,8 @@ class NPCSampler:
             cb = s.xyz[C['brow'][bodies]]
             cx = s.xyz[xr]
             wb, wx = C['tr_wb'][t], C['tr_wx'][t]
-            cen = ((jnp.sum(wb[:, None] * cb, 0) + jnp.sum(wx[:, None] * cx, 0))
+            cen = ((jnp.sum(wb[:, None] * cb, 0)
+                    + jnp.sum(wx[:, None] * cx, 0))
                    / (jnp.sum(wb) + jnp.sum(wx)))
             trans = in_sphere(u[3:6], C['mv_tr'][imov])
             qr = random_rot(u[6:9], C['mv_rot'][imov])
@@ -788,8 +787,8 @@ class NPCSampler:
         def run_batched(sb, nsteps):
             """nsteps MC steps of a batch of chains (leading axis). All
                chains are at the same SerialMover position."""
-            sb.rkey, U, Z = jax.vmap(draws, in_axes=(0, None))(sb.rkey,
-                                                                 nsteps)
+            sb.rkey, U, Z = jax.vmap(draws, in_axes=(0, None))(
+                sb.rkey, nsteps)
             i0 = sb.imov[0] + 1
             vstep = jax.vmap(step, in_axes=(0, None, 0, 0))
             return jax.lax.fori_loop(

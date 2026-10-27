@@ -2,8 +2,8 @@
 # GPU identity with the compilation cache (A), with autotuning off (B), and its speed cost (C)
 [ -n "$ENV_SH" ] && source "$ENV_SH"   # optional: environment (IMP, JAX venv)
 export JAX_PLATFORMS=cuda CUDA_VISIBLE_DEVICES=${GPU:-2} JAX_DEFAULT_MATMUL_PRECISION=highest
-cd "${NPC:?set NPC to the NPC_Basket clone that has bench/}/bench/jax"
 T=$(cd "$(dirname "$0")" && pwd); R=$T/gpu_runs2; rm -rf $R; mkdir -p $R
+cd "${NPC:?set NPC to the NPC_Basket clone that has bench/}/bench/jax"
 wait_lines() { while kill -0 $3 2>/dev/null; do
     [ -f $1 ] && [ $(wc -l < $1) -ge $2 ] && return 0; sleep 0.5; done; return 1; }
 stopped() { grep -E "stops after|continuing|frames done|Traceback|Error" $1 | tail -2; }

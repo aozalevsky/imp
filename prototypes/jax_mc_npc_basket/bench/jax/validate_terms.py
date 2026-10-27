@@ -8,10 +8,7 @@ the REX2 scoring function.
 import argparse
 import collections
 import json
-import sys
 import time
-
-import numpy as np
 
 ap = argparse.ArgumentParser()
 ap.add_argument('system', nargs='?', default='yeast')

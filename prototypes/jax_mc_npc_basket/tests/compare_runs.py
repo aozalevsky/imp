@@ -21,14 +21,18 @@ for st in stages:
         a, b = os.path.join(ref, st, f), os.path.join(test, st, f)
         ok = md5(a) == md5(b)
         bad += not ok
+        na, nb = (sum(1 for _ in open(p, 'rb')) for p in (a, b))
         print(f'{st}/{f}: {"identical" if ok else "DIFFERENT"} '
               f'({os.path.getsize(a)} / {os.path.getsize(b)} bytes, '
-              f'{sum(1 for _ in open(a, "rb"))} / {sum(1 for _ in open(b, "rb"))} lines)')
-za, zb = np.load(os.path.join(ref, 'state.cpt')), np.load(os.path.join(test, 'state.cpt'))
+              f'{na} / {nb} lines)')
+za = np.load(os.path.join(ref, 'state.cpt'))
+zb = np.load(os.path.join(test, 'state.cpt'))
 for k in sorted(za.files):
     if k == '__meta__':
         continue
-    ok = za[k].shape == zb[k].shape and np.array_equal(za[k], zb[k], equal_nan=True)
+    ok = (za[k].shape == zb[k].shape
+          and np.array_equal(za[k], zb[k], equal_nan=True))
     bad += not ok
-    print(f'state.cpt {k}: {"identical" if ok else "DIFFERENT"} {za[k].dtype} {za[k].shape}')
+    print(f'state.cpt {k}: {"identical" if ok else "DIFFERENT"} '
+          f'{za[k].dtype} {za[k].shape}')
 print('ALL IDENTICAL' if not bad else f'{bad} DIFFERENCES')

@@ -664,7 +664,7 @@ def run_stage(macro, g):
         checkpoint(done, sb, chain_of_temp, key, extra)
     for fh in outfiles:
         fh.close()
-    del rmfs
+    rmfs.clear()                      # closes the RMF files
     res = dict(stage=stage, name=name, session=SESSION, chains=N, ladders=L,
                replicas=K, frames=done, frames_this_run=nframes[0],
                nsteps=nsteps, wall=wall, t_host_output=t_out,

@@ -2,7 +2,8 @@
 starting configuration (the REX2 start after --frames1 C++ REX1 frames,
 seed 1), at T=1, recording the score after every PMI frame.
 
-  python ensemble.py cpp --system yeast --chains 0-3 --frames 10 --out ens.jsonl
+  python ensemble.py cpp --system yeast --chains 0-3 --frames 10 \\
+      --out ens.jsonl
   JAX_PLATFORMS=cuda python ensemble.py jax --system yeast --nchains 64 ...
 
 JAX runs with cov_mode='frozen' by default, i.e. EM model covariances fixed

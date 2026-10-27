@@ -13,7 +13,8 @@
    frame time.
 
 Run from NPC_Basket/bench/jax:
-  JAX_PLATFORMS=cuda python perf_headroom.py --chains 256,512,1024,2048,4096,8192,16384
+  JAX_PLATFORMS=cuda python perf_headroom.py
+(default sweep 256 to 16384 chains; --chains n1,n2,... to change it)
 """
 import argparse
 import collections
@@ -22,8 +23,6 @@ import os
 import re
 import sys
 import time
-
-import numpy as np
 
 ap = argparse.ArgumentParser()
 ap.add_argument('system', nargs='?', default='yeast')
@@ -37,10 +36,6 @@ a = ap.parse_args()
 sys.path.insert(0, os.getcwd())          # the sampler modules (bench/jax)
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
-import IMP  # noqa: E402
-import IMP.core  # noqa: E402
-import IMP.isd  # noqa: E402
-import IMP.pmi  # noqa: E402
 
 import imp_jax_npc  # noqa: E402
 from npc_setup import build  # noqa: E402
@@ -157,7 +152,8 @@ for i, d in enumerate(smp.movers):
 res['movers'] = dict(kind)
 res['per_chain_per_frame'] = {k: v * mc_steps for k, v in tot.items()}
 res['per_chain_per_frame_by_mover'] = {
-    k: {kk: vv * mc_steps for kk, vv in v.items()} for k, v in per_kind.items()}
+    k: {kk: vv * mc_steps for kk, vv in v.items()}
+    for k, v in per_kind.items()}
 row = [r for r in sweep if r['chains'] == n] or sweep[-1:]
 fr = row[0]
 res['achieved_at'] = dict(

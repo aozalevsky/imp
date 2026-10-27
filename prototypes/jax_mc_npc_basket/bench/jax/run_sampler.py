@@ -10,7 +10,6 @@ compared with C++ (rs.evaluate) and with a from-scratch JAX evaluation.
 """
 import argparse
 import json
-import os
 import time
 
 import numpy as np
@@ -59,10 +58,10 @@ m, rs = S.model, S.rs
 t0 = time.time()
 smp = (NPCSampler if a.sampler == 1 else NPCSampler2)(
     m, rs, S.movers, temperature=a.temperature,
-                 dtype='float64' if a.x64 else 'float32',
-                 cov_mode=a.cov_mode, em_extra=a.em_extra,
-                 use_switch=not a.no_switch,
-                 ablate=[x for x in a.ablate.split(',') if x])
+    dtype='float64' if a.x64 else 'float32',
+    cov_mode=a.cov_mode, em_extra=a.em_extra,
+    use_switch=not a.no_switch,
+    ablate=[x for x in a.ablate.split(',') if x])
 t_setup = time.time() - t0
 nsteps = a.mc_steps * smp.nmov
 print(f'IMP {IMP.get_module_version()} jax {jax.__version__} '

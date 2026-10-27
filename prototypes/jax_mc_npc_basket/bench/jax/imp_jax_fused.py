@@ -519,7 +519,6 @@ class _FusedMCOptimizer:
 
     # -- interface used by IMP.pmi.samplers.MonteCarlo ------------------------
     def get_initial_state(self, key=None):
-        import jax
         import jax.numpy as jnp
         import IMP.isd
         m = self._m

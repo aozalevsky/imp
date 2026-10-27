@@ -7,8 +7,6 @@ import argparse
 import json
 import time
 
-import numpy as np
-
 ap = argparse.ArgumentParser()
 ap.add_argument('system', nargs='?', default='yeast')
 ap.add_argument('--frames1', type=int, default=2)
@@ -27,7 +25,6 @@ a = ap.parse_args()
 
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
-import IMP  # noqa: E402
 
 import imp_jax_npc  # noqa: E402
 from npc_setup import build  # noqa: E402
@@ -36,8 +33,8 @@ from npc_sampler2 import NPCSampler2  # noqa: E402
 
 imp_jax_npc.install()
 S = build(a.system, frames1=a.frames1)
-smp = (NPCSampler if a.sampler == 1 else NPCSampler2)(S.model, S.rs, S.movers,
-                 ablate=[x for x in a.ablate.split(',') if x])
+smp = (NPCSampler if a.sampler == 1 else NPCSampler2)(
+    S.model, S.rs, S.movers, ablate=[x for x in a.ablate.split(',') if x])
 nsteps = a.mc_steps * smp.nmov
 s0 = smp.initial_state(seed=0)
 ap_mode = a.mode

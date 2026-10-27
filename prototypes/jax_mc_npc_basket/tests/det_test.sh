@@ -2,8 +2,8 @@
 # GPU run-to-run reproducibility: two identical uninterrupted runs per XLA setting
 [ -n "$ENV_SH" ] && source "$ENV_SH"   # optional: environment (IMP, JAX venv)
 export JAX_PLATFORMS=cuda CUDA_VISIBLE_DEVICES=${GPU:-2} JAX_DEFAULT_MATMUL_PRECISION=highest
-cd "${NPC:?set NPC to the NPC_Basket clone that has bench/}/bench/jax"
 T=$(cd "$(dirname "$0")" && pwd); R=$T/det_runs; rm -rf $R; mkdir -p $R
+cd "${NPC:?set NPC to the NPC_Basket clone that has bench/}/bench/jax"
 echo "JAX_COMPILATION_CACHE_DIR=${JAX_COMPILATION_CACHE_DIR:-unset}"
 python -c "import jax; print('jax', jax.__version__, 'cache dir', jax.config.jax_compilation_cache_dir)"
 RUN="python -u -W ignore run_npc_jax.py yeast --chains 256 --rex 2 --thin 10 --seed 7 --one-stage --shuffle-each --frames2 20 --cpt 0"
