@@ -1,8 +1,10 @@
 # jax_mc: a core plus recipes for fast, exact JAX Monte Carlo samplers
 
-Status, 2026-11-03: steps 1 and 2 are done (`system`, `terms`, `engine`,
-`check.terms`, `check.decisions`, `check.drift`, `bench`; see
-[Progress](#progress)). The templates are not written yet.
+Status, 2026-11-03: steps 1, 2 and 4 are done (`system`, `terms`,
+`engine`, `check`, `bench`, `run`, `rmf`, `templates/collective`), and step
+5's guide (GUIDE.md) and test script (`tests/check_all.sh`). Step 3
+(`templates/few_bodies_beads`, recipes R1-R7) is agy_imp's, in progress. See
+[Progress](#progress).
 
 ## Why
 
@@ -388,10 +390,11 @@ that have already been taken and checked.
 - **`few_bodies_beads`** reaches agy's speed and passes level D against the
   engine in float64, in both chain-count regimes.
 - **Every recipe** has its `check` call in one test script, which runs on a
-  GPU node in under 30 minutes.
+  GPU node in under 30 minutes. `tests/check_all.sh`: 12 minutes on one L40
+  with the core and `collective`; the recipes add their lines.
 - **Documentation:** a "make a fast sampler for your system" page that walks
   through choosing a template, then adding recipes one at a time, checking D
-  after each.
+  after each. GUIDE.md.
 
 ## Order of work
 
@@ -409,7 +412,8 @@ that have already been taken and checked.
    1.03 bn against 67 M), and its recipes are R1-R7 (agy_imp's) plus R10
    and R11, which the driver does.
 5. **The guide;** clean up the old prototype directories, which keep working
-   until the templates replace them.
+   until the templates replace them. Guide and test script done
+   2026-11-03; the cleanup waits for `few_bodies_beads`.
 
 ## Decisions taken without asking (change any)
 
@@ -635,3 +639,19 @@ float32 precision:
   float64, replica exchange.
 - Two concurrent processes with Open MPI's rank variables each took their
   own GPU and chain offset: Pol II, 2 × 4,096 chains.
+
+**Step 5, part 1 (2026-11-03): GUIDE.md and `tests/check_all.sh`.**
+- GUIDE.md walks from a new PMI system to a specialized sampler: add a
+  loader and check level T; run the engine (stop if it's fast enough);
+  profile, pick a level or a template, then one checked change at a time;
+  the pitfalls met so far; how to write a recipe.
+- `python -m jax_mc.check` now exits with status 1 when a check fails:
+  terms off by more than `--tol` (1e-9 relative; EM judged with C++'s pair
+  lists), or any differing decision in float64.
+- `tests/check_all.sh WORKDIR [quick|cpu]` runs levels T, D (engine and
+  templates, two chain-count regimes) and F, and checks that a restarted
+  run and a 2-process run equal one run. On one L40 (CPU parts on 4 cores):
+  all pass in 12 minutes; 0 decisions differ anywhere. Float32 drift after
+  50 sweeps: mzIdentML 1.5e-4, Pol II 6.9e-3 (EV), NPC basket 564 at an
+  energy of 5e7 (the pairs term). `cpu` mode (no GPU) takes 1 minute.
+

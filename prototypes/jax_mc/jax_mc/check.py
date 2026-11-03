@@ -65,16 +65,19 @@ def terms(s, n_states=6, seed=0, scale=3.0, out=print, cpp_float=True):
         a, b = vals[t.label], cpp[t.label]
         err = np.abs(a - b)
         rel = err / np.maximum(np.abs(b), 1e-300)
-        worst = max(worst, rel.max())
         out(f'  {t.label:28s} {len(t.restraints):5d} {b[0]:16.8g} '
             f'{err.max():14.3e} {rel.max():9.1e}')
         if t.label in masks:
+            # EM: C++ scores the pairs in its own lists (slack); compare
+            # with those lists, and judge the term by that
             mk = [np.stack(x, -1) for x in zip(*masks[t.label])]
             v = np.asarray(t.full(st, masks=mk), np.float64)
             e2 = np.abs(v - b)
+            rel = e2 / np.maximum(np.abs(b), 1e-300)
             out(f'  {"  with C++ pair lists":28s} {"":5s} {"":16s} '
-                f'{e2.max():14.3e} {(e2 / np.abs(b)).max():9.1e}  '
+                f'{e2.max():14.3e} {rel.max():9.1e}  '
                 f'per state {np.array2string(e2, precision=1)}')
+        worst = max(worst, rel.max())
     tot = sum(vals.values()) + s.constant
     err = np.abs(tot - cpp_total)
     out(f'  {"constant":28s} {len(s.constant_restraints):5d} '
@@ -83,7 +86,8 @@ def terms(s, n_states=6, seed=0, scale=3.0, out=print, cpp_float=True):
         f'{(err / np.abs(cpp_total)).max():9.1e}')
     if s.skipped:
         out(f'  skipped: {len(s.skipped)} restraints with weight 0')
-    return dict(vals=vals, cpp=cpp, total=tot, cpp_total=cpp_total, dx=dx)
+    return dict(vals=vals, cpp=cpp, total=tot, cpp_total=cpp_total, dx=dx,
+                worst=worst)
 
 
 def compare(a, b, sweeps=5, chains=16, kTs=(1.0,), seed=0, ref_chains=None,
@@ -223,6 +227,8 @@ def main():
     ap.add_argument('--sweeps', type=int, default=5)
     ap.add_argument('--kT', default='1')
     ap.add_argument('--float32', action='store_true')
+    ap.add_argument('--tol', type=float, default=1e-9,
+                    help='terms: largest relative error that passes')
     a = ap.parse_args()
     from . import xla_defaults
     xla_defaults()
@@ -231,14 +237,24 @@ def main():
     from . import sources, system
     src = sources.load(a.system)
     s = system.extract(src, cov_mode=a.cov)
+    # exit status 1 on failure, for scripts (tests/check_all.sh): terms
+    # off by more than --tol (relative) or positions by more than 1e-9;
+    # any differing decision in float64 (float32 only reports)
+    bad = False
     if a.what == 'terms':
-        terms(s, a.states, a.seed, a.scale)
+        r = terms(s, a.states, a.seed, a.scale)
+        bad = r['worst'] > a.tol or r['dx'].max() > 1e-9
     elif a.what == 'decisions':
-        decisions(s, a.sweeps, a.chains,
-                  [float(x) for x in a.kT.split(',')], a.seed, a.ref_chains,
-                  _factory(a.sampler) if a.sampler else None)
+        r = decisions(s, a.sweeps, a.chains,
+                      [float(x) for x in a.kT.split(',')], a.seed,
+                      a.ref_chains,
+                      _factory(a.sampler) if a.sampler else None)
+        bad = not a.float32 and any(x['ndiff'] for x in r)
     else:
         drift(s, a.sweeps, a.chains, a.seed)
+    if bad:
+        print(f'FAILED: check {a.what} {a.system}')
+        raise SystemExit(1)
 
 
 if __name__ == '__main__':
