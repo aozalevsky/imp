@@ -1,0 +1,73 @@
+#!/bin/bash
+# The measurements behind perf/speed.csv and perf/speed.png.
+#
+#   ENV_RELEASE='source <env with a release IMP build>' \
+#   ENV_FAST='source <env with a fast IMP build>' \
+#   perf/run.sh OUT [GPU] [CPU_CORE] [GPU_CORES]
+#
+# Run from prototypes/jax_mc. Both environments need JAX and the JAX_MC_*
+# system directories (jax_mc/sources.py); JAX runs use ENV_RELEASE (IMP only
+# builds the system there). Two streams run at the same time:
+#   CPU: C++ release, C++ fast and JAX with one chain, one after the other,
+#        pinned to core CPU_CORE (single-threaded XLA);
+#   GPU: JAX on GPU (CUDA device index), one chain, then growing chain
+#        counts (each in its own process, so running out of memory ends only
+#        that point), host threads on GPU_CORES.
+# SYSTEMS and STREAMS (cpu, gpu) in the environment run a subset.
+# Results are appended to OUT/results.jsonl, logs to OUT/*.log; then
+#   python -m perf.one_vs_many plot OUT/results.jsonl OUT
+set -u
+O=${1:?usage: perf/run.sh OUT [GPU] [CPU_CORE] [GPU_CORES]}
+GPU=${2:-0}; CORE=${3:-8}; GCORES=${4:-4-7}
+: "${ENV_RELEASE:?set ENV_RELEASE}" "${ENV_FAST:?set ENV_FAST}"
+mkdir -p "$O"
+R=$O/results.jsonl
+P="python -m perf.one_vs_many"
+keep() { grep '^RESULT ' | sed 's/^RESULT //' >> "$R"; }
+
+# per system: C++ steps per call and score_moved modes to time; burn-in (C++
+# steps, JAX sweeps); JAX sweeps per call with one chain and with many; GPU
+# chain counts to try. The mature NPC moves every body at every step, so
+# score_moved has nothing to skip there and runs far slower; not timed.
+declare -A CPP_STEPS=([mzid]=80000 [npc]=3540 [pm]=200 [polii]=24500)
+declare -A MODES=([mzid]=False,True [npc]=False,True [pm]=False
+                  [polii]=False,True)
+declare -A BURN=([mzid]=0 [npc]=0 [pm]=20000 [polii]=0)
+declare -A SW1=([mzid]=20000 [npc]=100 [pm]=500 [polii]=2000)
+declare -A SWN=([mzid]=100 [npc]=20 [pm]=500 [polii]=200)
+declare -A MANY=([mzid]="65536 262144 524288 1048576"
+                 [npc]="8192 16384 32768 65536"
+                 [pm]="512 1024 2048 4096"
+                 [polii]="16384 32768 65536 131072")
+SYSTEMS=${SYSTEMS:-mzid npc pm polii}
+STREAMS=${STREAMS:-cpu gpu}
+
+cpu_stream() {
+    for s in $SYSTEMS; do
+        for b in release fast; do
+            [ $b = release ] && E=$ENV_RELEASE || E=$ENV_FAST
+            ( eval "$E"; taskset -c $CORE $P cpp $s --steps ${CPP_STEPS[$s]} \
+                --burn ${BURN[$s]} --modes ${MODES[$s]} ) \
+                2> "$O/cpp_${b}_$s.log" | keep
+        done
+        ( eval "$ENV_RELEASE"; JAX_PLATFORMS=cpu \
+          XLA_FLAGS="--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1" \
+          taskset -c $CORE $P jax $s --chains 1 --sweeps ${SW1[$s]} \
+            --burn ${BURN[$s]} ) 2> "$O/jax_cpu_$s.log" | keep
+    done
+}
+
+gpu_stream() {
+    for s in $SYSTEMS; do
+        for c in 1 ${MANY[$s]}; do
+            [ $c = 1 ] && sw=${SW1[$s]} || sw=${SWN[$s]}
+            ( eval "$ENV_RELEASE"; JAX_PLATFORMS=cuda CUDA_VISIBLE_DEVICES=$GPU \
+              taskset -c $GCORES $P jax $s --chains $c --sweeps $sw \
+                --burn ${BURN[$s]} ) 2> "$O/jax_gpu_${s}_$c.log" | keep
+        done
+    done
+}
+
+for st in $STREAMS; do ${st}_stream & done
+wait
+echo "$(wc -l < "$R") results in $R"

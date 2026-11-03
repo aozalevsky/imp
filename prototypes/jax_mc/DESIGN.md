@@ -694,3 +694,10 @@ recipe, each with its level, asserted preconditions and a `factory` for
 engine) to 1.18 bn (template), with level D at every step. Recipes at level
 1 (R1, R4) drop into the engine unchanged through `extract(replace=...)`.
 
+
+**Speed plot (2026-11-03): `perf/`.** C++ IMP (nightly, release and fast
+builds, one chain on one core) against jax_mc on one CPU core and one L40,
+for all four systems; `perf/run.sh` remakes it. On the best GPU chain
+count: 1.11 bn (mzIdentML), 20.6 M (NPC basket), 1.03 M (mature NPC), 1.18
+bn (Pol II) MC steps/s, 5,700× to 61,000× C++ release. The generic engine
+with one chain is slower on the GPU than on one CPU core.

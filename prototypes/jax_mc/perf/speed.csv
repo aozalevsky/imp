@@ -1,0 +1,21 @@
+system,configuration,chains,mc_steps_per_s,x_vs_cpp_release,detail
+mzIdentML,C++ release,1,194027,1,score_moved on; IMP 20261103.develop.74ba496d88; check level 1
+mzIdentML,C++ fast,1,254400,1.311,score_moved on; IMP 20261103.develop.74ba496d88; check level 0
+mzIdentML,"JAX, 1 CPU core",1,718964,3.705,Engine; cpu; float32; acceptance 0.86
+mzIdentML,"JAX, 1 GPU, 1 chain",1,19183.1,0.09887,Engine; NVIDIA L40; float32; acceptance 0.86
+mzIdentML,"JAX, 1 GPU, best chain count",262144,1.10576e+09,5699,Engine; NVIDIA L40; float32; acceptance 0.91
+NPC basket,C++ release,1,2351.81,1,score_moved on; IMP 20261103.develop.74ba496d88; check level 1
+NPC basket,C++ fast,1,2831.57,1.204,score_moved on; IMP 20261103.develop.74ba496d88; check level 0
+NPC basket,"JAX, 1 CPU core",1,49154.5,20.9,Engine; cpu; float32; acceptance 0.16
+NPC basket,"JAX, 1 GPU, 1 chain",1,7409.83,3.151,Engine; NVIDIA L40; float32; acceptance 0.16
+NPC basket,"JAX, 1 GPU, best chain count",65536,2.05838e+07,8752,Engine; NVIDIA L40; float32; acceptance 0.38
+mature NPC,C++ release,1,98.8534,1,score_moved off; IMP 20261103.develop.74ba496d88; check level 1
+mature NPC,C++ fast,1,193.442,1.957,score_moved off; IMP 20261103.develop.74ba496d88; check level 0
+mature NPC,"JAX, 1 CPU core",1,1611.7,16.3,CollectiveNL; cpu; float32; acceptance 0.0008
+mature NPC,"JAX, 1 GPU, 1 chain",1,23067.9,233.4,CollectiveNL; NVIDIA L40; float32; acceptance 0.0008
+mature NPC,"JAX, 1 GPU, best chain count",1024,1.03389e+06,1.046e+04,CollectiveNL; NVIDIA L40; float32; acceptance 0.0011
+Pol II,C++ release,1,19251.2,1,score_moved on; IMP 20261103.develop.74ba496d88; check level 1
+Pol II,C++ fast,1,22025.9,1.144,score_moved on; IMP 20261103.develop.74ba496d88; check level 0
+Pol II,"JAX, 1 CPU core",1,396040,20.57,FewBodiesBeads; cpu; float32; acceptance 0.63
+Pol II,"JAX, 1 GPU, 1 chain",1,313773,16.3,FewBodiesBeads; NVIDIA L40; float32; acceptance 0.63
+Pol II,"JAX, 1 GPU, best chain count",32768,1.18082e+09,6.134e+04,FewBodiesBeads; NVIDIA L40; float32; acceptance 0.62

@@ -7,7 +7,7 @@ sampled fast on a GPU, with the same decisions as IMP. It walks through:
 3. if it isn't, specializing it one checked step at a time.
 
 DESIGN.md explains why things are the way they are. This page only says what
-to do.
+to do. `perf/speed.png` shows what the four systems so far gain over C++ IMP.
 
 ## 0. Setup
 
