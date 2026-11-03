@@ -158,17 +158,22 @@ The first set covers the four systems:
   - no caches that hold only under conditions the engine doesn't check.
 
 **Random numbers (a contract for every sampler built on the core).**
-- **The draws:**
-  - for chain c, sweep s: `k = fold_in(chain_key[c], s)`;
-  - `U = uniform(k, (n_movers, 8))`;
-  - `Z = normal(fold_in(k, 1), (n_movers,))`.
-- **The columns** of mover i's row:
-  - 0-2: ball or translation;
-  - 3-6: rotation axis and angle;
-  - 7: Metropolis;
-  - `Z[i]`: nuisance.
+- **The draws,** for chain c, sweep s:
+  - `k = fold_in(chain_key[c], s)`;
+  - `U = uniform(k, (n_movers, 3))`;
+  - `Z = normal(fold_in(k, 1), (n_movers, 6))`.
+- **Mover i uses its row.**
+  - Ball, or translation: direction `Z[i, 0:3]` normalized, radius from
+    `U[i, 0]` (r = R u^(1/3)).
+  - Rotation: axis `Z[i, 3:6]` normalized, angle from `U[i, 1]`.
+  - Metropolis: `U[i, 2]`.
+  - Nuisance: `Z[i, 0]`.
+
+  This is the shape agy_imp proposed (forum #imp t154 p1233). It is what
+  its sampler already uses, so no `erf_inv` or Box-Muller on uniforms.
 - **Slicing is allowed** if the draws stay bitwise equal: generate the full
-  shape, then slice (agy's sliced RNG does this).
+  shape, then slice.
+- **Per-chain keys** give each chain the same numbers whatever C is.
 - **Per-sweep `fold_in`** gives random access, so blocked and unrolled
   samplers can consume the same numbers.
 
@@ -282,8 +287,8 @@ adapts. Each one has:
 - **Plain JAX only in the core.** Pallas stays a recipe.
 - **The engine's sweep is dynamic** (scan + switch), not unrolled.
   Unrolling is recipe R2.
-- **The random-number contract** (`fold_in` per sweep, (n_movers, 8)
-  uniforms). The existing Pol II and NPC samplers draw differently, so their
+- **The random-number contract** (`fold_in` per sweep, 3 uniforms and 6
+  normals per mover). The existing Pol II and NPC samplers draw differently, so their
   old trajectories won't be reproduced. Level D is checked between samplers
   on the core.
 - **mzIdentML moves from IMP's full-rescore path to the incremental engine.**
@@ -337,3 +342,20 @@ steps) and float64 on the CPU. Both checks below pass on all four systems:
 - **Two PMI ball-mover styles.** Pol II's ball movers act on the local
   coordinates of non-rigid members of static bodies (a ball in the parent
   frame). The NPC basket's act on x, y, z.
+
+**Review by agy_imp (t154 p1233), applied:**
+- `X (3, rows, C)` stays the layout.
+- A body's own particle is now its first member at local (0, 0, 0), so
+  `positions()` is a plain concatenation, with no gather.
+- EV accumulates in a `fori_loop`, and keeps its rows in static/body/bead
+  order (`n_static`) for the delta step and the static-grid recipe.
+- bayesianem EM computes its slope distances separately, so XLA can fuse the
+  main reduction on GPU.
+- Kept apart on purpose, two quaternion-to-matrix forms:
+  - positions use IMP's `Rotation3D` form (matches IMP exactly);
+  - covariances use Eigen's form (as `core::Gaussian` does).
+- For step 2: check on GPU that the scan/switch loop has no full copies of
+  `X`, with every branch threading `X` through.
+- Split of work: agy_imp takes `few_bodies_beads` and recipes R1-R7 once the
+  engine exists. It has fixed the six review items in its sampler
+  (antigravity repo ff5cf6a); they were verified on GPU up to 65,536 chains.

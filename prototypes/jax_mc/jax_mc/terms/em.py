@@ -14,6 +14,7 @@ history (salilab/imp#1121). `extra` widens the cutoff here.
 import math
 
 import numpy as np
+import jax
 import jax.numpy as jnp
 
 from . import Term, geom
@@ -283,6 +284,12 @@ class EMBayes(_EM):
         nd = len(self.dens_pis)
         e = nd * 0.5 * jnp.log(jnp.sum(lt * lt, axis=0)) + self.cached
         if self.slope > 0.:
-            e = e + self.slope * jnp.sum(jnp.sqrt(jnp.min(d2, axis=1)),
+            # recomputed from a barrier'd copy: reducing d2 over axis 1 here
+            # and over axis 0 above would keep XLA GPU from fusing either
+            # reduction with its producer, materializing (n, D, C)
+            xb = jax.lax.optimization_barrier(xm)
+            v = xb[:, :, None] - self.dx[:, None, :, None]
+            dsl = v[0] * v[0] + v[1] * v[1] + v[2] * v[2]
+            e = e + self.slope * jnp.sum(jnp.sqrt(jnp.min(dsl, axis=1)),
                                          axis=0)
         return self.w * e

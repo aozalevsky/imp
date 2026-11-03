@@ -9,13 +9,15 @@ Layout (all float64 numpy on the host):
 
 * rows: every particle a term reads. Each row is one of
     STATIC  fixed global coordinates
-    CENTER  a moving rigid body's own particle (position = its translation)
-    MEMBER  a member of a moving rigid body (local coordinates)
+    MEMBER  a member of a moving rigid body (local coordinates); the body's
+            own particle is its first member, at local (0, 0, 0)
+            (row_is_center marks it)
     BEAD    a particle moved by a BallMover or a TransformMover (global
             coordinates are degrees of freedom); a NonRigidMember of a
             static body is allowed
   Rows are ordered static first, then body by body (center, members), then
-  beads in mover order, so that each mover's rows are contiguous.
+  beads in mover order, so that each mover's rows are contiguous and
+  positions() is a plain concatenation.
 * nuisances: every Scale particle a term reads (value, bounds).
 * degrees of freedom, chain-last: quat (4, nb, C), trans (3, nb, C),
   bead (3, nbead, C), nuis (N, C). positions() gives X (3, rows, C).
@@ -27,7 +29,7 @@ import numpy as np
 
 from . import imp_hooks
 
-STATIC, CENTER, MEMBER, BEAD = 0, 1, 2, 3
+STATIC, MEMBER, BEAD = 0, 2, 3
 
 
 class Unsupported(Exception):
@@ -50,7 +52,10 @@ class Mover:
 
 
 def quat_to_rot(q, xp=np):
-    """(4, ...) unit quaternions (w, x, y, z) -> (3, 3, ...) rotations"""
+    """(4, ...) unit quaternions (w, x, y, z) -> (3, 3, ...) rotations, in
+       the form IMP::algebra::Rotation3D uses (w*w + x*x - y*y - z*z, ...),
+       so member positions match IMP's exactly. (Gaussian covariances use
+       Eigen's form instead, as core::Gaussian does: terms.geom.)"""
     w, x, y, z = q[0], q[1], q[2], q[3]
     return xp.stack([
         xp.stack([w * w + x * x - y * y - z * z, 2 * (x * y - w * z),
@@ -278,6 +283,7 @@ class System:
         local = np.zeros((n, 3))
         xyz0 = np.zeros((n, 3))
         radius = np.zeros(n)
+        is_center = np.zeros(n, bool)
         for i, p in enumerate(rows):
             pp = pi_(p)
             if IMP.core.XYZ.get_is_setup(m, pp):
@@ -285,7 +291,8 @@ class System:
             if IMP.core.XYZR.get_is_setup(m, pp):
                 radius[i] = IMP.core.XYZR(m, pp).get_radius()
             if p in self.body_index:
-                kind[i], ref[i] = CENTER, self.body_index[p]
+                kind[i], ref[i] = MEMBER, self.body_index[p]
+                is_center[i] = True
             elif p in self._member_body:
                 kind[i] = MEMBER
                 ref[i] = self.body_index[self._member_body[p]]
@@ -298,6 +305,13 @@ class System:
             elif p in self.bead_index:
                 kind[i], ref[i] = BEAD, self.bead_index[p]
         self.row_kind, self.row_ref = kind, ref
+        self.row_is_center = is_center
+        # the concatenation in positions() relies on this order
+        assert np.all(np.diff(kind[kind != STATIC]) >= 0)
+        assert np.all(kind[:np.sum(kind == STATIC)] == STATIC)
+        bd = ref[kind == BEAD]
+        assert np.array_equal(bd, np.arange(len(bd)))
+        assert np.all(np.diff(ref[kind == MEMBER]) >= 0)
         self.row_local, self.row_xyz0, self.row_radius = local, xyz0, radius
         self.n_rows = n
         # nuisances: moved ones first (mover order), then the rest
@@ -320,7 +334,7 @@ class System:
         # rows each mover moves
         rows_of_body = {}
         for i in range(n):
-            if kind[i] in (CENTER, MEMBER):
+            if kind[i] == MEMBER:
                 rows_of_body.setdefault(int(ref[i]), []).append(i)
         for mv in self.movers:
             r = []
@@ -346,34 +360,24 @@ class System:
                     nuis=np.repeat(self.nuis0[:, None], C, axis=1))
 
     def positions(self, dofs, xp=np):
-        """X (3, rows, C) from chain-last degrees of freedom"""
+        """X (3, rows, C) from chain-last degrees of freedom: static rows,
+           then members (R_b local + t_b), then beads, concatenated"""
         quat, trans, bead = dofs['quat'], dofs['trans'], dofs['bead']
-        C = quat.shape[-1] if self.nb else bead.shape[-1] if self.nbead \
-            else dofs['nuis'].shape[-1]
-        X = xp.broadcast_to(xp.asarray(self.row_xyz0.T)[..., None],
-                            (3, self.n_rows, C))
+        C = dofs['nuis'].shape[-1] if self.n_nuis else \
+            (quat.shape[-1] if self.nb else bead.shape[-1])
         kind = self.row_kind
+        n_st = int(np.sum(kind == STATIC))
+        parts = [xp.broadcast_to(xp.asarray(self.row_xyz0[:n_st].T)[..., None],
+                                 (3, n_st, C))]
         mem = np.nonzero(kind == MEMBER)[0]
-        cen = np.nonzero(kind == CENTER)[0]
-        bd = np.nonzero(kind == BEAD)[0]
-        parts = [(np.nonzero(kind == STATIC)[0], X[:, kind == STATIC])]
         if len(mem):
-            R = quat_to_rot(quat, xp)                   # (3, 3, nb, C)
-            b = self.row_ref[mem]
-            loc = xp.asarray(self.row_local[mem].T)     # (3, n)
-            Rb = R[:, :, b]                             # (3, 3, n, C)
-            xm = (Rb[:, 0] * loc[0][:, None] + Rb[:, 1] * loc[1][:, None]
-                  + Rb[:, 2] * loc[2][:, None]) + trans[:, b]
-            parts.append((mem, xm))
-        if len(cen):
-            parts.append((cen, trans[:, self.row_ref[cen]]))
-        if len(bd):
-            parts.append((bd, bead[:, self.row_ref[bd]]))
-        order = np.concatenate([p[0] for p in parts])
-        Xc = xp.concatenate([p[1] for p in parts], axis=1)
-        inv = np.empty_like(order)
-        inv[order] = np.arange(len(order))
-        return Xc[:, inv]
+            R = quat_to_rot(quat, xp)[:, :, self.row_ref[mem]]  # (3,3,n,C)
+            loc = xp.asarray(self.row_local[mem].T)[..., None]  # (3, n, 1)
+            parts.append(R[:, 0] * loc[0] + R[:, 1] * loc[1]
+                         + R[:, 2] * loc[2] + trans[:, self.row_ref[mem]])
+        if self.nbead:
+            parts.append(bead)
+        return xp.concatenate(parts, axis=1)
 
     def get_imp_dofs(self):
         """Current IMP model state as C=1 chain-last dofs"""

@@ -145,8 +145,13 @@ class SoftSphereEV(Term):
         self.restraints.append((w, d))
 
     def finalize(self, s):
-        self.rows = s.rows(self.ps)
+        rows = s.rows(self.ps)
+        order = np.argsort(rows, kind='stable')     # static, bodies, beads
+        self.rows, self.lab = rows[order], self.lab[order]
         self.r = s.row_radius[self.rows]
+        kind = s.row_kind[self.rows]
+        self.n_static = int(np.sum(kind == 0))      # for the static recipes
+        self.row_kind, self.row_ref = kind, s.row_ref[self.rows]
 
     def full(self, st):
         X = st['X'][:, self.rows]                   # (3, n, C)
@@ -179,8 +184,9 @@ class SoftSphereEV(Term):
                     & (li[:, None] != lab[None]))
             return jnp.sum(jnp.where(keep[..., None], x * x, 0.),
                            axis=(0, 1))
-        return 0.5 * self.kk * jnp.sum(jax.lax.map(block, jnp.arange(nb_)),
-                                       axis=0)
+        acc = jax.lax.fori_loop(0, nb_, lambda b, a: a + block(b),
+                                jnp.zeros(C, X.dtype))
+        return 0.5 * self.kk * acc
 
 
 class CrossLinks(Term):
