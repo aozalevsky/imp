@@ -451,7 +451,7 @@ class CollectiveNL:
              'in_count', 'in_quat', 'in_trans', 'mem_idx', 'mem_count',
              'em_idx', 'em_count', 'overflow')
 
-    def init(self, C, seed=0, kT=None, dofs=None):
+    def init(self, C, seed=0, kT=None, dofs=None, chain0=0):
         s, dt = self.s, self.dtype()
         d = s.initial_dofs(C) if dofs is None else dofs
         d = {k: jnp.asarray(v, dt) for k, v in d.items()}
@@ -469,7 +469,8 @@ class CollectiveNL:
         kT = s.kT if kT is None else kT
         return dict(d, **L, energy=e,
                     kT=jnp.broadcast_to(jnp.asarray(kT, dt), (C,)),
-                    key=E.chain_keys(seed, C), sweep=jnp.zeros((), jnp.int32),
+                    key=E.chain_keys(seed, C, chain0),
+                    sweep=jnp.zeros((), jnp.int32),
                     n_acc=jnp.zeros((1, C), jnp.int32),
                     n_inner=jnp.zeros(C, jnp.int32),
                     n_outer=jnp.zeros(C, jnp.int32))

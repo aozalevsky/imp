@@ -193,7 +193,8 @@ The first set covers the four systems:
 
 **Random numbers (a contract for every sampler built on the core).**
 - **The draws,** for chain c, sweep s, in the run's dtype:
-  - `chain_key[c] = fold_in(key(seed), c)`;
+  - `chain_key[c] = fold_in(key(seed), c)`, with c the chain's index in
+    the whole run (over all processes);
   - `k = fold_in(chain_key[c], s)`;
   - `U = uniform(k, (n_movers, 3))`;
   - `Z = normal(fold_in(k, 1), (n_movers, 6))`.
@@ -255,7 +256,11 @@ checkpointing:
   --best N` rebuilds the system and writes `OUT/rmf/chain<c>.rmf3`,
   `rung<r>.rmf3` (following one temperature through a ladder) or
   `best.rmf3`. Frames are named with frame, chain and energy.
-- **Not yet:** one process per GPU.
+- **One process per GPU** (`--ranks N --rank r`, or under mpirun or
+  srun): each runs `--chains` chains into `OUT/rank<r>/`. Together they are
+  exactly one run of N × `--chains` chains, because the keys are per chain
+  and the exchange draws per ladder of the whole run. The processes don't
+  communicate.
 
 ### `jax_mc.check`: the exactness harness
 
@@ -332,7 +337,9 @@ keep the engine's state or have its own:
 ```python
 class MySampler:
     s                                         # the jax_mc System
-    def init(self, C, seed=0, kT=None): ...   # state: any pytree
+    def init(self, C, seed=0, kT=None, dofs=None, chain0=0): ...
+        # state: any pytree (a dict with 'kT' (C,) for jax_mc.run);
+        # chains chain0 .. chain0 + C - 1 of the run
     def run(self, st, n_sweeps, record=False): ...
         # record=True: (state, decisions (n_sweeps, n_movers, C) bool)
     def dofs(self, st): ...         # the System's degrees of freedom
@@ -395,8 +402,12 @@ that have already been taken and checked.
    against today's samplers on one L40. Done 2026-11-03.
 3. **`few_bodies_beads`:** port agy's sampler onto the core and fix the review
    items. Write recipes R1-R7 from it.
-4. **`many_movers` and `collective`;** recipes R8-R11. `collective` and
-   `jax_mc.run` and RMF output done 2026-11-03; next `many_movers`.
+4. **`many_movers` and `collective`;** recipes R8-R11. Done 2026-11-03:
+   `collective`, `jax_mc.run` (R10, R11) with RMF output and one process
+   per GPU. `many_movers` isn't separate code for now. The engine already
+   beats its targets (NPC basket 14.6-20.5 M against 11.5 M; mzIdentML
+   1.03 bn against 67 M), and its recipes are R1-R7 (agy_imp's) plus R10
+   and R11, which the driver does.
 5. **The guide;** clean up the old prototype directories, which keep working
    until the templates replace them.
 
@@ -617,3 +628,10 @@ float32 precision:
 | Pol II | 9e-6 Å |
 | mzIdentML | 1e-6 Å |
 | mature NPC | 6e-5 Å |
+
+**One process per GPU (2026-11-03).**
+- Two processes of 16 chains give exactly the records (energies,
+  temperatures) and snapshots of one 32-chain run: mzIdentML, CPU,
+  float64, replica exchange.
+- Two concurrent processes with Open MPI's rank variables each took their
+  own GPU and chain offset: Pol II, 2 × 4,096 chains.

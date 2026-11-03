@@ -5,6 +5,7 @@
       [--rescore-every K] [--thin T] [--block F] [--seed S]
       [--sampler my.module:factory] [--float64]
       [--cpi] [--cpt MINUTES] [--maxh HOURS] [--jax-cache DIR]
+  mpirun -np 4 python -m jax_mc.run ...   # one process per GPU
 
 A frame is --sweeps sweeps (collective samplers: steps). Frames run in
 blocks of --block inside one jitted call, and the next block is dispatched
@@ -37,7 +38,13 @@ a restarted session runs the same executables: XLA does not always compile
 a program bit-identically twice. The Python hash seed is pinned to 0 (PMI
 builds systems in set order).
 
-The sampler's state must be a dict with 'kT' (C,).
+Several processes (--ranks N, or under mpirun/srun) each run --chains
+chains, one GPU each, into OUT/rank<r>/: together they are exactly one
+run of N x --chains chains (per-chain random keys; exchange draws per
+ladder of the whole run). They don't communicate.
+
+The sampler's state must be a dict with 'kT' (C,), and its init must take
+chain0 (the index of its first chain in the whole run).
 """
 import argparse
 import json
@@ -54,11 +61,13 @@ REX_TAG = 0xFFFFFFFF            # fold_in data for the exchange draws
 
 
 # ---------------- temperature policies (device side) -------------------------
-def rex_swap(E, rung, ladder, frame, key):
+def rex_swap(E, rung, ladder, frame, key, ladder0=0):
     """one exchange round. E (C,) energies, rung (C,) each chain's place
        in its ladder (chains c // R form ladder c // R, R = len(ladder));
        returns the new rungs. Swap (r, r + 1) with r % 2 == frame % 2 is
-       accepted if u < exp((1/kT_r - 1/kT_{r+1}) (E_at_r - E_at_r+1))."""
+       accepted if u < exp((1/kT_r - 1/kT_{r+1}) (E_at_r - E_at_r+1)).
+       u is drawn per ladder from its index in the whole run (ladder0 +
+       l), so splitting the chains between processes changes nothing."""
     import jax
     import jax.numpy as jnp
     C, R = E.shape[0], ladder.shape[0]
@@ -69,8 +78,9 @@ def rex_swap(E, rung, ladder, frame, key):
     r = jnp.arange(R - 1)
     a, b = inv[:, r], inv[:, r + 1]                         # (L, R - 1)
     db = 1. / ladder[r] - 1. / ladder[r + 1]
-    u = jax.random.uniform(jax.random.fold_in(key, frame), (L, R - 1),
-                           E.dtype)
+    kf = jax.random.fold_in(key, frame)
+    u = jax.vmap(lambda g: jax.random.uniform(
+        jax.random.fold_in(kf, g), (R - 1,), E.dtype))(ladder0 + jnp.arange(L))
     acc = (r % 2 == frame % 2) & (jnp.log(u) < db * (E[a] - E[b]))
     rr = jnp.broadcast_to(r, a.shape).astype(rung.dtype)
     # only accepted pairs are written: active pairs are disjoint, but an
@@ -88,7 +98,7 @@ def anneal_kT(frame, tmin, tmax, nmin, nmax):
 
 # ---------------- the jitted block -------------------------------------------
 def make_block(smp, sweeps, n_frames, rescore_every=1, ladder=None,
-               anneal=None, seed=0, snapshot=True):
+               anneal=None, seed=0, snapshot=True, ladder0=0):
     """f(st, rung, frame0) -> st, rung, records, dofs (of the last frame).
        records: drift (F,), energy (F, C), kT (F, C)."""
     import jax
@@ -114,7 +124,7 @@ def make_block(smp, sweeps, n_frames, rescore_every=1, ladder=None,
                 f % K == K - 1, rescore, lambda st: (st, e, drift), st)
         kT = st['kT']
         if lad is not None:
-            rung = rex_swap(e, rung, lad, f, rkey)
+            rung = rex_swap(e, rung, lad, f, rkey, ladder0)
             st = dict(st, kT=lad[rung].astype(kT.dtype))
         return (st, rung), (drift, e, kT)
 
@@ -260,11 +270,16 @@ class _Stop:
 # ---------------- the driver -------------------------------------------------
 def run(smp, out, chains, frames, sweeps=10, kT=None, ladder=None,
         anneal=None, rescore_every=1, thin=10, block=10, seed=0, cpi=False,
-        cpt=15., maxh=-1., settings=None, say=print):
-    """Run `frames` frames (-1: until stopped). Returns a summary dict."""
+        cpt=15., maxh=-1., settings=None, rank=0, ranks=1, say=print):
+    """Run `frames` frames (-1: until stopped). Returns a summary dict.
+       With ranks > 1 this process runs chains rank * chains ..
+       (rank + 1) * chains - 1 of the whole run, into out/rank<rank>."""
     import jax
     import jax.numpy as jnp
     t_launch = time.time()
+    chain0 = rank * chains
+    if ranks > 1:
+        out = os.path.join(out, f'rank{rank}')
     os.makedirs(out, exist_ok=True)
     if ladder is not None and chains % len(ladder):
         raise ValueError('--chains must be a multiple of the ladder length')
@@ -273,7 +288,7 @@ def run(smp, out, chains, frames, sweeps=10, kT=None, ladder=None,
     p_cpt, p_meta = (os.path.join(out, x) for x in ('state.cpt', 'run.json'))
     cfg = dict(settings or {}, chains=chains, sweeps=sweeps, ladder=ladder,
                anneal=anneal, rescore_every=rescore_every, thin=thin,
-               seed=seed)
+               seed=seed, rank=rank, ranks=ranks, chain0=chain0)
     if cpi and os.path.exists(p_cpt):
         ck = read_checkpoint(p_cpt)
         old = {k: ck['cfg'].get(k) for k in cfg}
@@ -289,7 +304,7 @@ def run(smp, out, chains, frames, sweeps=10, kT=None, ladder=None,
     else:
         kTs = ladder if ladder is not None else kT
         kTs = None if kTs is None else np.resize(np.atleast_1d(kTs), chains)
-        st = smp.init(chains, seed, kTs)
+        st = smp.init(chains, seed, kTs, chain0=chain0)
         rung = jnp.asarray(np.arange(chains) % len(ladder) if ladder
                            else np.zeros(chains), jnp.int32)
         f0 = 0
@@ -297,6 +312,8 @@ def run(smp, out, chains, frames, sweeps=10, kT=None, ladder=None,
             open(p, 'wb').close()
     lay = dof_layout(jax.eval_shape(smp.dofs, st))
     meta = dict(cfg, dof_layout=lay, sampler=type(smp).__name__,
+                device=str(jax.devices()[0]),
+                cuda_visible_devices=os.environ.get('CUDA_VISIBLE_DEVICES'),
                 record='frame, drift, energy (C), kT (C); float64',
                 dofs='frame, then per chain the dof_layout arrays; float32')
     json.dump(meta, open(p_meta, 'w'), indent=1)
@@ -307,7 +324,9 @@ def run(smp, out, chains, frames, sweeps=10, kT=None, ladder=None,
     def get_block(n):
         if n not in fns:
             fns[n] = make_block(smp, sweeps, n, rescore_every, ladder,
-                                anneal, seed)
+                                anneal, seed,
+                                ladder0=chain0 // len(ladder) if ladder
+                                else 0)
         return fns[n]
     writer = None
     t_cpt = time.time()
@@ -397,17 +416,29 @@ def main():
     ap.add_argument('--cov', default='frozen')
     ap.add_argument('--jax-cache', default=None,
                     help='compile cache (default OUT/jax_cache)')
+    ap.add_argument('--ranks', type=int, default=None,
+                    help='processes (default: Open MPI or Slurm, else 1)')
+    ap.add_argument('--rank', type=int, default=None)
     a = ap.parse_args()
     from . import pin_hash_seed, xla_defaults
     pin_hash_seed()
     xla_defaults()
+    env = os.environ
+    ranks = a.ranks or int(env.get('OMPI_COMM_WORLD_SIZE',
+                                   env.get('SLURM_NTASKS', 1)))
+    rank = a.rank if a.rank is not None else int(env.get(
+        'OMPI_COMM_WORLD_RANK', env.get('SLURM_PROCID', 0)))
+    local = env.get('OMPI_COMM_WORLD_LOCAL_RANK', env.get('SLURM_LOCALID'))
+    if ranks > 1 and local is not None and \
+            'CUDA_VISIBLE_DEVICES' not in env:
+        env['CUDA_VISIBLE_DEVICES'] = local         # one GPU per process
     import jax
     jax.config.update('jax_enable_x64', a.float64)
     # every session of a run uses the same executables: XLA doesn't always
     # compile a program the same way twice, and restarts should continue
     # exactly
-    jax.config.update('jax_compilation_cache_dir',
-                      a.jax_cache or os.path.join(a.out, 'jax_cache'))
+    jax.config.update('jax_compilation_cache_dir', a.jax_cache or os.path.join(
+        a.out, f'rank{rank}' if ranks > 1 else '', 'jax_cache'))
     jax.config.update('jax_persistent_cache_min_compile_time_secs', 0)
     jax.config.update('jax_persistent_cache_min_entry_size_bytes', -1)
     from . import sources, system
@@ -429,7 +460,7 @@ def main():
     run(smp, a.out, a.chains, a.frames, a.sweeps, a.kT, ladder, anneal,
         a.rescore_every, a.thin, a.block, a.seed, a.cpi, a.cpt, a.maxh,
         settings=dict(system=a.system, sampler=a.sampler, cov=a.cov,
-                      float64=a.float64))
+                      float64=a.float64), rank=rank, ranks=ranks)
 
 
 if __name__ == '__main__':
