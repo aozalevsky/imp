@@ -251,7 +251,11 @@ checkpointing:
     session runs the same executables.
   - The Python hash seed is pinned to 0, because PMI builds systems in set
     order.
-- **Not yet:** RMF from the snapshots, and one process per GPU.
+- **RMF afterwards:** `python -m jax_mc.rmf OUT --chains 0,1 --rung R
+  --best N` rebuilds the system and writes `OUT/rmf/chain<c>.rmf3`,
+  `rung<r>.rmf3` (following one temperature through a ladder) or
+  `best.rmf3`. Frames are named with frame, chain and energy.
+- **Not yet:** one process per GPU.
 
 ### `jax_mc.check`: the exactness harness
 
@@ -392,7 +396,7 @@ that have already been taken and checked.
 3. **`few_bodies_beads`:** port agy's sampler onto the core and fix the review
    items. Write recipes R1-R7 from it.
 4. **`many_movers` and `collective`;** recipes R8-R11. `collective` and
-   `jax_mc.run` done 2026-11-03; next RMF output, then `many_movers`.
+   `jax_mc.run` and RMF output done 2026-11-03; next `many_movers`.
 5. **The guide;** clean up the old prototype directories, which keep working
    until the templates replace them.
 
@@ -603,3 +607,13 @@ Speed on one L40, float32 (`python -m jax_mc.bench`), in MC steps/s:
   - `jax_mc.run` pins `PYTHONHASHSEED=0`.
 - **JAX only caches compiles slower than 1 s by default.** The driver
   caches every program.
+
+**RMF output (2026-11-03).** Files written from snapshots were read back
+with `IMP.rmf`. Their coordinates match the snapshot positions to RMF's
+float32 precision:
+
+| system | max difference |
+|---|---|
+| Pol II | 9e-6 Å |
+| mzIdentML | 1e-6 Å |
+| mature NPC | 6e-5 Å |

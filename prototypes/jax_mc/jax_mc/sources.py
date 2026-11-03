@@ -28,6 +28,7 @@ class Source:
     kT: float = 1.0
     extra: dict = field(default_factory=dict)
     ladder: list = None         # the protocol's REX temperatures, if any
+    hier: object = None         # root hierarchy (for RMF output)
 
 
 def _dir(var):
@@ -46,7 +47,7 @@ def polii(**kw):
     import build_system
     S = build_system.build(**kw)
     return Source('polii', S.m, list(S.rs.get_restraints()), list(S.movers),
-                  'serial', extra=dict(S=S))
+                  'serial', extra=dict(S=S), hier=S.root_hier)
 
 
 def npc_basket(system='yeast', frames1=2, **kw):
@@ -59,7 +60,7 @@ def npc_basket(system='yeast', frames1=2, **kw):
     from npc_setup import build
     S = build(system, frames1=frames1, **kw)
     return Source('npc_' + system, S.model, [S.rs], list(S.movers),
-                  'serial', extra=dict(S=S))
+                  'serial', extra=dict(S=S), hier=S.rex2.root_hier)
 
 
 def mature_npc(time='mature', temp_index=0, **kw):
@@ -74,7 +75,7 @@ def mature_npc(time='mature', temp_index=0, **kw):
               for rb in S.rigbods]
     return Source('mature_npc', S.m, list(S.rs), movers, 'all',
                   kT=float(S.temps[temp_index]), extra=dict(S=S),
-                  ladder=[float(t) for t in S.temps])
+                  ladder=[float(t) for t in S.temps], hier=S.hc)
 
 
 def mzid(seed=1):
@@ -82,13 +83,13 @@ def mzid(seed=1):
     _dir('JAX_MC_MZID')
     imp_hooks.install()
     import common
-    m, smp = common.build_system(seed=seed)
+    m, smp, root = common.build_system(seed=seed, return_root=True)
     mc = smp.mc
     movers = [mc.get_mover(i) for i in range(mc.get_number_of_movers())]
     return Source('mzid', m, list(mc.get_scoring_function()
                                   .create_restraints()),
                   movers, 'serial', kT=float(mc.get_kt()),
-                  extra=dict(smp=smp))
+                  extra=dict(smp=smp), hier=root)
 
 
 LOADERS = dict(polii=polii, npc=npc_basket, pm=mature_npc, mzid=mzid)

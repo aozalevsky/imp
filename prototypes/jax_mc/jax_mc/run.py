@@ -165,11 +165,12 @@ def snapshots(out):
     n = sum(int(np.prod(s)) for _, s in lay)
     a = np.fromfile(os.path.join(out, 'dofs.f32'), np.float32).reshape(
         -1, 1 + C * n)
-    frames, body = a[:, 0].astype(np.int64), a[:, 1:].reshape(-1, C, n)
+    S = a.shape[0]
+    frames, body = a[:, 0].astype(np.int64), a[:, 1:].reshape(S, C, n)
     res, o = {}, 0
     for k, sh in lay:
         m = int(np.prod(sh))
-        res[k] = body[:, :, o:o + m].reshape((-1, C) + tuple(sh))
+        res[k] = body[:, :, o:o + m].reshape((S, C) + tuple(sh))
         o += m
     return frames, res
 
