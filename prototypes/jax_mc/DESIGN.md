@@ -700,4 +700,14 @@ builds, one chain on one core) against jax_mc on one CPU core and one L40,
 for all four systems; `perf/run.sh` remakes it. On the best GPU chain
 count: 1.11 bn (mzIdentML), 20.6 M (NPC basket), 1.03 M (mature NPC), 1.18
 bn (Pol II) MC steps/s, 5,700× to 61,000× C++ release. The generic engine
-with one chain is slower on the GPU than on one CPU core.
+with one chain is slower on the GPU than on one CPU core. The core engine
+alone, next to the template: Pol II 265 M vs 1.18 bn; mature NPC 320 vs
+1.03 M (`CollectiveEngine` scores all 32,256 beads' pairs every step, so
+the template's neighbour lists are worth 3,000× there). The one-chain bars
+are the core's too: on one CPU core the mature NPC's core does 0.41 MC
+steps/s against C++'s 99 (all pairs against close pairs: 2.4 s of its 2.45 s
+per step is excluded volume). The templates on one CPU core: 1,612 (mature
+NPC) and 396k (Pol II, core 158k), so specializing pays on the CPU too.
+mzIdentML and the NPC basket run on the core only. Next for the core: a
+neighbour-list EV (from the collective template's R8) above some bead
+count.

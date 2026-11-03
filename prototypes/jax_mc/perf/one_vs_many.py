@@ -5,7 +5,7 @@ pay off on one GPU.
   python -m perf.one_vs_many cpp SYSTEM [--steps N] [--reps 5] [--burn B]
       [--modes False,True]
   python -m perf.one_vs_many jax SYSTEM --chains C [--sweeps S] [--reps 5]
-      [--burn B]
+      [--burn B] [--core]
   python -m perf.one_vs_many plot results.jsonl OUTDIR
 
 Each measurement prints one line 'RESULT {json}' (perf/run.sh appends them
@@ -20,8 +20,10 @@ with a full rescore, and the plot uses the faster mode that stays exact.
 --burn runs that many steps untimed first, with score_moved off. Which IMP
 build runs (release or fast) is up to the environment.
 
-jax: the fastest jax_mc sampler for the system (SAMPLERS), float32, the
-protocol's kT. The state is donated between calls, as in production.
+jax: the system's template if it has one (SAMPLERS), else the core engine
+(engine.make: Engine, or CollectiveEngine for the mature NPC); --core takes
+the core engine anyway. float32, the protocol's kT. The state is donated
+between calls, as in production.
 --burn runs that many sweeps untimed first (the mature NPC's collective
 steps rebuild their neighbour lists constantly from the starting structure).
 
@@ -44,6 +46,14 @@ SAMPLERS = dict(polii='templates.few_bodies_beads.sampler:factory',
 NAMES = dict(mzid='mzIdentML', npc='NPC basket', pm='mature NPC',
              polii='Pol II')
 ORDER = ('mzid', 'npc', 'pm', 'polii')
+CPU1 = 'JAX core, 1 CPU core'
+GPU1 = 'JAX core, 1 GPU, 1 chain'
+CORE = 'JAX core, 1 GPU, best chain count'
+TCPU1 = 'JAX template, 1 CPU core'
+TEMPLATE = 'JAX template, 1 GPU, best chain count'
+BARS = ['C++ release', 'C++ fast', CPU1, TCPU1,      # one CPU core
+        GPU1, CORE, TEMPLATE]                       # one GPU
+BLOCKS = (4, 3)
 
 
 def result(d):
@@ -102,7 +112,8 @@ def jax_run(a):
     from jax_mc import check, engine, sources, system
     s = system.extract(sources.load(a.system))
     spec = SAMPLERS[a.system]
-    smp = check._factory(spec)(s) if spec else engine.make(s)
+    core = a.core or spec is None
+    smp = engine.make(s) if core else check._factory(spec)(s)
     n = smp.steps_per_sweep
     run = jax.jit(smp.run, static_argnums=(1, 2), donate_argnums=0)
     t0 = time.perf_counter()
@@ -122,6 +133,7 @@ def jax_run(a):
            / (a.chains * n * a.sweeps * a.reps))
     dev = jax.devices()[0]
     result(dict(kind='jax', system=a.system, sampler=type(smp).__name__,
+                core=core,
                 platform=dev.platform, device=dev.device_kind,
                 chains=a.chains, sweeps=a.sweeps, steps_per_sweep=n,
                 reps=a.reps, burn=a.burn, first_call_s=first,
@@ -149,27 +161,30 @@ def rows(path):
                        f'IMP {d["imp"]}; '
                        f'check level {d["check_level"]}')
         else:
-            cpu = d['platform'] == 'cpu'
-            key = (d['system'], 'cpu' if cpu else
-                   ('gpu1' if d['chains'] == 1 else f'gpu{d["chains"]}'))
-            cfg[key] = dict(
-                system=d['system'],
-                bar='JAX, 1 CPU core' if cpu else (
-                    'JAX, 1 GPU, 1 chain' if d['chains'] == 1
-                    else 'JAX, 1 GPU, best chain count'),
-                steps_per_s=d['steps_per_s'], chains=d['chains'],
+            core = d.get('core', SAMPLERS[d['system']] is None)
+            if d['platform'] == 'cpu':
+                key, bar = ('cpu', CPU1) if core else ('tcpu', TCPU1)
+            elif d['chains'] == 1:
+                if not core:                # the GPU one-chain bar: core
+                    continue
+                key, bar = 'gpu1', GPU1
+            else:
+                key = f'gpu{d["chains"]}' + ('core' if core else '')
+                bar = CORE if core else TEMPLATE
+            cfg[(d['system'], key)] = dict(
+                system=d['system'], bar=bar, steps_per_s=d['steps_per_s'],
+                chains=d['chains'],
                 detail=f'{d["sampler"]}; {d["device"]}; float32; '
                        f'acceptance {d["acceptance"]:.2g}')
     out = []
     for sysn in ORDER:
         mine = [v for k, v in cfg.items() if k[0] == sysn]
-        many = [v for v in mine if v['bar'] == 'JAX, 1 GPU, best chain count']
-        keep = [v for v in mine if v not in many]
-        if many:
-            keep.append(max(many, key=lambda v: v['steps_per_s']))
-        order = ['C++ release', 'C++ fast', 'JAX, 1 CPU core',
-                 'JAX, 1 GPU, 1 chain', 'JAX, 1 GPU, best chain count']
-        out += sorted(keep, key=lambda v: order.index(v['bar']))
+        keep = [v for v in mine if v['bar'] not in (CORE, TEMPLATE)]
+        for bar in (CORE, TEMPLATE):
+            many = [v for v in mine if v['bar'] == bar]
+            if many:
+                keep.append(max(many, key=lambda v: v['steps_per_s']))
+        out += sorted(keep, key=lambda v: BARS.index(v['bar']))
     return out
 
 
@@ -199,12 +214,25 @@ def plot(a):
     note = (f'C++: IMP {", ".join(imp)}, one chain on one core, score_moved '
             f'on' + (f' (off for the {", ".join(off)})' if off else '') +
             f'. JAX {", ".join(jx)}, float32, on one CPU core or one '
-            f'{", ".join(gpu)}. Pol II and mature NPC: jax_mc templates; NPC '
-            'basket and mzIdentML: the generic engine. A mature NPC step '
-            'moves all 112 bodies, in C++ and in JAX.')
+            f'{", ".join(gpu)}. JAX core: the generic engine. JAX template: '
+            'templates/few_bodies_beads (Pol II) and templates/collective '
+            '(mature NPC); mzIdentML and the NPC basket have none yet. A '
+            'mature NPC step moves all 112 bodies, in C++ and in JAX; its '
+            'core engine scores all 520 M bead pairs per step (no neighbour '
+            'lists), C++ and the template only close pairs.')
+    sub = {}
+    for sysn in ORDER:
+        best = {r['bar']: r['chains'] for r in R
+                if r['system'] == sysn and r['bar'] in (CORE, TEMPLATE)}
+        if TEMPLATE in best:
+            sub[sysn] = (f'best chain counts: core {best[CORE]:,}, '
+                         f'template {best[TEMPLATE]:,}')
+        elif CORE in best:
+            sub[sysn] = f'best chain count: {best[CORE]:,}'
     from perf.figure import draw
-    draw(R, NAMES, ORDER, os.path.join(a.outdir, 'speed.png'),
-         title='Monte Carlo speed: C++ IMP vs jax_mc', note=note)
+    draw(R, NAMES, ORDER, BARS, os.path.join(a.outdir, 'speed.png'),
+         title='Monte Carlo speed: C++ IMP vs jax_mc', note=note, sub=sub,
+         blocks=BLOCKS)
 
 
 def main():
@@ -223,6 +251,8 @@ def main():
     j.add_argument('--sweeps', type=int, default=100)
     j.add_argument('--reps', type=int, default=5)
     j.add_argument('--burn', type=int, default=0)
+    j.add_argument('--core', action='store_true',
+                   help='the core engine even if the system has a template')
     p = sub.add_parser('plot')
     p.add_argument('results')
     p.add_argument('outdir')
