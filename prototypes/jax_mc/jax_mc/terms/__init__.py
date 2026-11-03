@@ -189,18 +189,22 @@ class ImpJax(Term):
         import jax
         import IMP.jax
         X, nuis = st['X'], st['nuis']
+        dt = X.dtype
 
         def one(xc, nc):
-            pad3 = jnp.full((1, 3), jnp.inf, xc.dtype)
+            xyz = jnp.full((xc.shape[1] + 1, 3), jnp.inf, dt) \
+                if xc.shape[0] == 0 else \
+                jnp.concatenate([xc.T, jnp.full((1, 3), jnp.inf, dt)])
             jm = IMP.jax._JAXModel(
-                xyz=IMP.jax._CompactArray(
-                    jnp.concatenate([xc.T, pad3]), self._rremap),
-                r=IMP.jax._CompactArray(jnp.asarray(self._radius, xc.dtype),
+                xyz=IMP.jax._CompactArray(xyz, self._rremap),
+                r=IMP.jax._CompactArray(jnp.asarray(self._radius, dt),
                                         self._rremap))
             jm[self._scale_key] = IMP.jax._CompactArray(
-                jnp.concatenate([nc, jnp.full(1, jnp.inf, xc.dtype)]),
+                jnp.concatenate([nc, jnp.full(1, jnp.inf, dt)]),
                 self._nremap)
             return sum(w * info.score_func(jm) for w, info in self._infos)
+        if len(self.rows_read) == 0:        # nuisance priors: no positions
+            X = jnp.zeros((0, X.shape[1], X.shape[2]), dt)
         return jax.vmap(one, in_axes=(2, 1))(X, nuis)
 
 

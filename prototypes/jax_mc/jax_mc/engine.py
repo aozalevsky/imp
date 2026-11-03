@@ -300,11 +300,15 @@ class Engine:
                         return _rotate(Rr, y - c[:, None]) + c[:, None] \
                             + v[:, None]
                     tn = tt(tb)
-                b = jnp.maximum(t['bslot'], 0)
-                R = quat_to_rot(qn, jnp)[:, :, b]              # (3,3,M,C)
+                R = quat_to_rot(qn, jnp)                       # (3,3,kb,C)
+                if G.kind == 'rb':      # one body: broadcast, no gather
+                    tm = tn
+                else:
+                    b = jnp.maximum(t['bslot'], 0)
+                    R, tm = R[:, :, b], tn[:, b]               # (3,3,M,C)
                 loc = t['loc'][..., None]                      # (3, M, 1)
                 Xn = R[:, 0] * loc[0] + R[:, 1] * loc[1] + R[:, 2] * loc[2] \
-                    + tn[:, b]
+                    + tm
                 if G.kind == 'transform':
                     Xn = jnp.where((t['bslot'] >= 0)[None, :, None], Xn,
                                    tt(Xo))

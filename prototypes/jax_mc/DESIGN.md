@@ -284,6 +284,56 @@ adapts. Each one has:
 | `many_movers` | hundreds of movers, generic PMI terms (NPC basket, mzIdentML) | the engine plus R1, R5 and R9 | R1, R5, R9-R11 | NPC basket > 11.5 M; mzIdentML > 67 M (incremental instead of full rescore) |
 | `collective` | every step moves every body (mature NPC) | `pm_sampler2.py`, moved onto `system`, `terms` and `run`, with its own step | R8, R10, R11 | ≥ 1.2 M; then batch or fuse the rebuilds |
 
+## From the engine to a specialized sampler
+
+The engine is generic and slower on purpose. The way to full speed is a
+series of small steps away from it, each checked against it:
+1. make one change;
+2. run `check decisions` against the engine, in float64, at ≤ 2,048 and
+   > 4,096 chains;
+3. run the benchmark;
+4. drop the change if it doesn't make things faster.
+
+**The sampler protocol** is all `check` needs, so a specialized sampler can
+keep the engine's state or have its own:
+
+```python
+class MySampler:
+    s                                         # the jax_mc System
+    def init(self, C, seed=0, kT=None): ...   # state: any pytree
+    def run(self, st, n_sweeps, record=False): ...
+        # record=True: (state, decisions (n_sweeps, n_movers, C) bool)
+    def dofs(self, st): ...         # the System's degrees of freedom (numpy)
+    def total(self, st): ...        # (C,) tracked total energy
+    def resync(self, st): ...       # optional: energies from scratch
+```
+
+It must use the random-number contract and the engine's proposals.
+`Engine.draws` gives the numbers.
+
+```
+python -m jax_mc.check decisions polii --sampler my.module:factory \
+    --chains 8192 --ref-chains 512
+```
+
+`factory(system)` returns the sampler. It runs every chain, and the
+engine, as the reference, runs the first `--ref-chains` of them.
+
+**Three levels of specialization, smallest first:**
+1. **A faster term.** Subclass a term and override `cache`, `move_tables`
+   and `delta`, then build the system with
+   `extract(source, replace={SoftSphereEV: StaticGridEV})`. The engine and
+   everything else stay as they are. R1's static EV grid fits here.
+2. **A faster branch.** Subclass `Engine` and override `_branch(G)` for
+   some groups, keeping the state layout and the draws. For example, R3's
+   blocked bead steps replace the `ball` group's branch.
+3. **Your own sweep.** Override `Engine.sweep` (R2's unrolled mover order),
+   or write a sampler from scratch with its own state layout, keeping only
+   the protocol and the draws. `few_bodies_beads` is this level.
+
+Each recipe says which level it works at. A template is a set of steps
+that have already been taken and checked.
+
 ## Acceptance
 
 - **Level T** passes on all four systems from the IMP model, with no
@@ -291,10 +341,10 @@ adapts. Each one has:
 - **The engine runs Pol II, the NPC basket and mzIdentML.** On one L40:
   - NPC basket: at least `npc_sampler2`'s speed (met: see Progress);
   - mzIdentML: at least 67 M (met);
-  - Pol II: within 2× of `few_bodies_beads`. Not met: 4.4× slower than
-    agy's 1.16 bn. Changed without asking: the engine stays generic, and
-    this speed is the template's job (R1-R3 remove what limits the
-    engine; see Progress).
+  - Pol II: within 2× of `few_bodies_beads`. Dropped: the engine is
+    4.4× slower than agy's 1.16 bn, and R1-R3 remove what limits it (see
+    Progress). Arthur, 2026-11-03: a slower generic engine is fine as long
+    as the path to a specialized sampler is clean (the section above).
 - **`few_bodies_beads`** reaches agy's speed and passes level D against the
   engine in float64, in both chain-count regimes.
 - **Every recipe** has its `check` call in one test script, which runs on a

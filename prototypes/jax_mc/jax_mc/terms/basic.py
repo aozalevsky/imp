@@ -338,15 +338,21 @@ class CrossLinks(Term):
         self.nuis_read = np.unique(np.concatenate([self.s0, self.s1,
                                                    self.psi]))
 
-    def energies(self, res, xa, xb, nu):
-        """(len(res), C) -log(w_r p_r) of restraints res, from the
-           positions (3, len(res), cmax, C) of their contributions' ends"""
+    def dists(self, res, xa, xb):
+        """(len(res), cmax, C) distances of restraints res' contributions
+           from the positions (3, len(res), cmax, C) of their ends"""
+        c = jnp.minimum(jnp.asarray(self.con)[res], len(self.cp) - 1)
+        g = lambda a: jnp.asarray(a)[c]                     # noqa
+        return jnp.where(g(self.same)[..., None], 36.0 / 35.0
+                         * g(self.r0)[..., None], geom.norm(xa - xb))
+
+    def energies(self, res, d, nu):
+        """(len(res), C) -log(w_r p_r) of restraints res from their
+           contributions' distances d"""
         nc = len(self.cp)
         cidx = jnp.asarray(self.con)[res]                   # (R, cmax)
         c = jnp.minimum(cidx, nc - 1)
         g = lambda a: jnp.asarray(a)[c]                     # noqa
-        d = jnp.where(g(self.same)[..., None], 36.0 / 35.0
-                      * g(self.r0)[..., None], geom.norm(xa - xb))
         term = geom.xl_term(d, nu[g(self.s0)], nu[g(self.s1)],
                             nu[g(self.psi)], self.length, self.slope,
                             self.CPP_FLOAT)                 # (R, cmax, C)
@@ -358,12 +364,20 @@ class CrossLinks(Term):
         c = np.minimum(self.con[res], len(self.cp) - 1)
         return self.ca[c], self.cb[c]
 
-    def full(self, st):
-        X = st['X']
+    def _all_dists(self, X):
         res = np.arange(len(self.rcon))
         a, b = self._ends(res)
-        return self.w * jnp.sum(self.energies(res, X[:, a], X[:, b],
-                                              st['nuis']), axis=0)
+        return res, self.dists(res, X[:, a], X[:, b])
+
+    def full(self, st):
+        res, d = self._all_dists(st['X'])
+        return self.w * jnp.sum(self.energies(res, d, st['nuis']), axis=0)
+
+    def delta_nuis(self, st, cache, nuis):
+        res, d = self._all_dists(st['X'])
+        return self.w * jnp.sum(self.energies(res, d, nuis)
+                                - self.energies(res, d, st['nuis']),
+                                axis=0), cache
 
     def move_tables(self, s, moves):
         """restraints with a contribution that has exactly one end moved,
@@ -398,7 +412,8 @@ class CrossLinks(Term):
         c = jnp.minimum(jnp.asarray(self.con)[rr], len(self.cp) - 1)
         a, b = jnp.asarray(self.ca)[c], jnp.asarray(self.cb)[c]
         X, nu = st['X'], st['nuis']
-        e = self.energies(rr, mv.pos(a, tab['sa']), mv.pos(b, tab['sb']), nu) \
-            - self.energies(rr, X[:, a], X[:, b], nu)
+        e = self.energies(rr, self.dists(rr, mv.pos(a, tab['sa']),
+                                         mv.pos(b, tab['sb'])), nu) \
+            - self.energies(rr, self.dists(rr, X[:, a], X[:, b]), nu)
         return self.w * jnp.sum(jnp.where((q < nres)[:, None], e, 0.),
                                 axis=0), cache

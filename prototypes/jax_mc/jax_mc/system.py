@@ -466,9 +466,12 @@ def _qmul(a, b):
 
 
 # ---------------------------------------------------------------------------
-def extract(source, cov_mode='frozen', imp_jax_fallback=True):
-    """System for a jax_mc.sources.Source"""
+def extract(source, cov_mode='frozen', imp_jax_fallback=True, replace=None):
+    """System for a jax_mc.sources.Source. replace: {term class: subclass}
+       to build some terms with a faster subclass (a specialization that
+       keeps the engine; see DESIGN.md)"""
     from . import terms as T
+    replace = replace or {}
     s = System(source, cov_mode)
     s._movers()
     s._score_states()
@@ -486,7 +489,7 @@ def extract(source, cov_mode='frozen', imp_jax_fallback=True):
             if key is not None:
                 k = (cls, key)
                 if k not in builders:
-                    builders[k] = cls(key)
+                    builders[k] = replace.get(cls, cls)(key)
                 builders[k].add(s, w, d)
                 return
         if isinstance(d, IMP.RestraintSet):

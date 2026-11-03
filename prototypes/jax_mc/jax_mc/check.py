@@ -2,6 +2,7 @@
 
   python -m jax_mc.check terms polii [--states 6] [--cov frozen|rotate]
   python -m jax_mc.check decisions polii [--chains 16 --sweeps 5 --kT 1,10]
+      [--ref-chains R] [--sampler my.module:factory]
   python -m jax_mc.check drift polii [--chains 256 --sweeps 100]
 
 terms: at random states near the initial one, compare
@@ -85,24 +86,33 @@ def terms(s, n_states=6, seed=0, scale=3.0, out=print, cpp_float=True):
     return dict(vals=vals, cpp=cpp, total=tot, cpp_total=cpp_total, dx=dx)
 
 
-def decisions(s, sweeps=5, chains=16, kTs=(1.0,), seed=0, ref_chains=None,
-              out=print):
-    """Level D: the incremental engine against the full-rescore engine
-       (same draws). Reports differing decisions, the acceptance rate per
-       mover kind, the tracked energy against a rescore, and positions.
-       A chain's draws don't depend on the number of chains, so the
-       reference can run on the first ref_chains chains only."""
+def compare(a, b, sweeps=5, chains=16, kTs=(1.0,), seed=0, ref_chains=None,
+            out=print):
+    """Level D between two samplers that follow the sampler protocol
+       (DESIGN.md, "From the engine to a specialized sampler"): a, under
+       test, runs `chains` chains; b, the reference, runs the first
+       ref_chains of them (a chain's draws don't depend on the number of
+       chains). Reports differing decisions, acceptance per mover kind,
+       a's tracked energy against a rescore, and the energy and positions
+       of chains where no decision differs."""
     import jax
-    from .engine import Engine
-    a, b = Engine(s), Engine(s, incremental=False)
+    s = a.s
     ra = jax.jit(a.run, static_argnums=(1, 2))
     rb = jax.jit(b.run, static_argnums=(1, 2))
-    kinds = np.array([mv.kind for mv in s.movers])
     R = chains if ref_chains is None else min(ref_chains, chains)
-    out(f'{s.name}: {len(s.movers)} movers in {len(a.groups)} groups '
-        f'({", ".join(f"{G.kind} x{len(G.movers)}" for G in a.groups)}); '
-        f'{chains} chains ({R} in the reference), {sweeps} sweeps, '
-        f'{a.dtype().__name__}, {jax.devices()[0].device_kind}')
+    kinds = np.array([mv.kind for mv in s.movers])
+
+    def name(x):
+        return type(x).__name__ + (' (full rescore)' if getattr(
+            x, 'incremental', True) is False else '')
+    out(f'{s.name}: {name(a)} against {name(b)}; '
+        f'{len(s.movers)} movers; {chains} chains ({R} in the reference), '
+        f'{sweeps} sweeps, '
+        f'{"float64" if jax.config.jax_enable_x64 else "float32"}, '
+        f'{jax.devices()[0].device_kind}')
+    if hasattr(a, 'groups'):
+        out('  groups: ' + ', '.join(f'{G.kind} x{len(G.movers)}'
+                                     for G in a.groups))
     res = []
     for kT in kTs:
         sa, sb = a.init(chains, seed, kT), b.init(R, seed, kT)
@@ -115,28 +125,53 @@ def decisions(s, sweeps=5, chains=16, kTs=(1.0,), seed=0, ref_chains=None,
         t2 = time.time()
         diff = da[..., :R] != db
         hit = diff.any(axis=(0, 1))
+        ok = ~hit
         acc = ', '.join(f'{k} {da[:, kinds == k].mean():.2f}'
                         for k in dict.fromkeys(kinds))
-        Ea = np.asarray(a.total(sa))
-        Er = np.asarray(a.total(jax.jit(a.resync)(sa)))
-        Ea, Eb = Ea[:R], np.asarray(b.total(sb))
-        ok = ~hit
-        dX = (np.abs(np.asarray(sa['X'])[..., :R]
-                     - np.asarray(sb['X']))[..., ok].max()
-              if ok.any() else np.nan)
-        dE = np.abs(Ea - Eb)[ok].max() if ok.any() else np.nan
         out(f'  kT {kT:g}: {int(diff.sum())} of {diff.size} decisions differ'
             f' ({int(hit.sum())} chains); acceptance {acc}')
         if diff.any():
             sw, mo, ch = np.argwhere(diff)[0]
             out(f'    first: sweep {sw}, mover {mo} ({kinds[mo]}), chain {ch}')
-        Er = Er[:R]
-        out(f'    tracked - rescored energy: max {np.abs(Ea - Er).max():.2e}'
-            f'; vs full-rescore engine: energy {dE:.2e}, positions {dX:.2e}'
-            f'; time {t1 - t0:.1f} s / {t2 - t1:.1f} s (incl. compile)')
-        res.append(dict(kT=kT, ndiff=int(diff.sum()), n=diff.size,
-                        dE_track=float(np.abs(Ea - Er).max()), dX=dX))
+        r = dict(kT=kT, ndiff=int(diff.sum()), n=diff.size)
+        msg = []
+        if hasattr(a, 'resync'):
+            Ea = np.asarray(a.total(sa))
+            Er = np.asarray(a.total(jax.jit(a.resync)(sa)))
+            r['dE_track'] = float(np.abs(Ea - Er).max())
+            msg.append(f'tracked - rescored energy: max {r["dE_track"]:.2e}')
+        if ok.any():
+            Xa = s.positions(a.dofs(sa))[..., :R][..., ok]
+            Xb = s.positions(b.dofs(sb))[..., ok]
+            r['dX'] = float(np.abs(Xa - Xb).max())
+            dE = np.abs(np.asarray(a.total(sa))[:R]
+                        - np.asarray(b.total(sb)))[ok].max()
+            msg.append(f'vs reference: energy {dE:.2e}, positions '
+                       f'{r["dX"]:.2e}')
+        msg.append(f'time {t1 - t0:.1f} s / {t2 - t1:.1f} s (incl. compile)')
+        out('    ' + '; '.join(msg))
+        res.append(r)
     return res
+
+
+def decisions(s, sweeps=5, chains=16, kTs=(1.0,), seed=0, ref_chains=None,
+              sampler=None, out=print):
+    """Level D. Without `sampler`: the incremental engine against the
+       full-rescore engine (same draws). With sampler (a factory
+       s -> sampler): that sampler against the engine."""
+    from .engine import Engine
+    if sampler is None:
+        a, b = Engine(s), Engine(s, incremental=False)
+    else:
+        a, b = sampler(s), Engine(s)
+    return compare(a, b, sweeps, chains, kTs, seed, ref_chains, out)
+
+
+def _factory(spec):
+    """'package.module:name' -> the object"""
+    import importlib
+    mod, name = spec.split(':')
+    return getattr(importlib.import_module(mod), name)
 
 
 def drift(s, sweeps=100, chains=256, seed=0, kT=None, out=print):
@@ -169,6 +204,9 @@ def main():
     ap.add_argument('--cov', default='frozen')
     ap.add_argument('--chains', type=int, default=16)
     ap.add_argument('--ref-chains', type=int, default=None)
+    ap.add_argument('--sampler', default=None,
+                    help='module:factory, factory(system) -> sampler, '
+                    'checked against the engine')
     ap.add_argument('--sweeps', type=int, default=5)
     ap.add_argument('--kT', default='1')
     ap.add_argument('--float32', action='store_true')
@@ -184,7 +222,8 @@ def main():
         terms(s, a.states, a.seed, a.scale)
     elif a.what == 'decisions':
         decisions(s, a.sweeps, a.chains,
-                  [float(x) for x in a.kT.split(',')], a.seed, a.ref_chains)
+                  [float(x) for x in a.kT.split(',')], a.seed, a.ref_chains,
+                  _factory(a.sampler) if a.sampler else None)
     else:
         drift(s, a.sweeps, a.chains, a.seed)
 
