@@ -107,13 +107,12 @@ class SoftSphereEV(Term):
         import IMP.core
         m = d.get_model()
         if isinstance(d, IMP.core.ExcludedVolumeRestraint):
-            k = d.get_score_object().get_derived_object().get_k() \
-                if hasattr(d, 'get_score_object') else None
-            (lsc,) = [o for o in d.get_inputs()
-                      if 'Container' in type(o).__name__
-                      or hasattr(o, 'get_contents')] or [None]
-            ps = [int(p) for p in IMP.SingletonContainer.get_from(
-                lsc).get_contents()]
+            so = d.get_score_object().get_derived_object()
+            if not isinstance(so, IMP.core.SoftSpherePairScore):
+                raise Unsupported('ExcludedVolumeRestraint score '
+                                  + type(so).__name__)
+            k = so.get_k()
+            ps = [int(p) for p in d.get_container().get_contents()]
             bipartite = None
         else:
             cpc = d.get_container().get_derived_object()
@@ -160,7 +159,8 @@ class SoftSphereEV(Term):
                 (lab[:, None] != lab[None])
             return 0.5 * self.kk * jnp.sum(
                 jnp.where(keep[..., None], x * x, 0.), axis=(0, 1))
-        B = 512
+        C = X.shape[-1]
+        B = int(max(8, min(512, 2 ** 22 // (n * C))))
         nb_ = -(-n // B)
         pad = nb_ * B - n
         Xp = jnp.pad(X, ((0, 0), (0, pad), (0, 0)))

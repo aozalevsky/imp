@@ -1,6 +1,7 @@
 # jax_mc: a core plus recipes for fast, exact JAX Monte Carlo samplers
 
-Status: design, 2026-11-03. Nothing here is implemented yet.
+Status, 2026-11-03: step 1 is done (`system`, `terms`, `check.terms`; see
+[Progress](#progress)). The engine and the templates are not written yet.
 
 ## Why
 
@@ -296,3 +297,43 @@ adapts. Each one has:
 - Should IMP restraints expose a JAX `delta` next to their JAX score
   function, so that `system` and `terms` don't need their own copies of the
   math?
+
+## Progress
+
+**Step 1 (2026-11-03): `system`, `terms`, `check.terms`.** Run with
+`python -m jax_mc.check terms polii|npc|pm|mzid`. Each run uses 6 random
+states near the start (bodies, beads and nuisances moved by up to 3 mover
+steps) and float64 on the CPU. Both checks below pass on all four systems:
+- positions from the degrees of freedom equal IMP's exactly;
+- every term matches the C++ restraints it replaces to round-off.
+
+| system | rows | bodies / beads / nuisances | terms | worst relative error |
+|---|---|---|---|---|
+| mzIdentML | 38 | 3 / 11 / 2 | cross-links, priors | 4e-16 |
+| Pol II | 688 | 2 / 47 / 4 | connectivity, EV, cross-links ×2, priors, isd EM | 2e-16 (EM 6e-3 with cutoffs) |
+| NPC basket | 1,644 | 39 / 309 / 5 | pairs, z-axial, membrane surface, cross-links ×2, priors, bayesianem EM, EV | 2e-16 (EM 6.5e-4 with cutoffs) |
+| mature NPC | 32,854 | 112 / 0 / 0 | bbox, membrane binding and depth, overall position ×32,256, isd EM (swapped), EV | 3e-14 (EM 8e-4 with cutoffs) |
+
+**EM is checked with the pair lists the C++ restraint used** at each state
+(`cpp_masks`). With plain cutoffs it differs by the slack effect
+(salilab/imp#1121).
+
+**Things learned:**
+- **C++ doesn't rotate covariances.** IMP still scores Gaussians with the
+  global covariance from setup (`--cov frozen`); `rotate` is 1.7e-2 off on
+  Pol II.
+- **`sphere_cap` is single precision in C++.** Its arguments are floats.
+  `CrossLinks.CPP_FLOAT` emulates that for checks, but only eagerly: under
+  `jit`, XLA CPU's fused float32 arithmetic differs by about 1e-9. So
+  `check.terms` evaluates eagerly. Production code stays plain float64 or
+  float32.
+- **Host constants must be numpy.** Constants computed with `jnp` in
+  `finalize()` were float32 whenever x64 wasn't on yet.
+- **Some parameters need recording at construction.** EM cutoffs and particle
+  lists, the bounding-box function and the membrane-score parameters have no
+  Python getters. `imp_hooks.install()` records their constructor arguments,
+  and snapshots the EM restraints' Gaussians, whose setup-time terms C++
+  caches. The mature NPC protocol builds its EM restraint as `(data, model)`.
+- **Two PMI ball-mover styles.** Pol II's ball movers act on the local
+  coordinates of non-rigid members of static bodies (a ball in the parent
+  frame). The NPC basket's act on x, y, z.

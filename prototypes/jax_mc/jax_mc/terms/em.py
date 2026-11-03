@@ -105,16 +105,20 @@ class _EM(Term):
                     mm[i, j] = True
         return md, mm
 
-    def _model_cov(self, st):
-        """(6, n, C) model covariances"""
+    @staticmethod
+    def _cov(st, owner, cloc, cglob):
+        """(6, n, C) covariances: rotating with the owner body, or fixed"""
         C = st['X'].shape[-1]
-        fixed = jnp.broadcast_to(jnp.asarray(self.cglob)[..., None],
-                                 self.cglob.shape + (C,))
-        if not np.any(self.owner >= 0):
+        fixed = jnp.broadcast_to(jnp.asarray(cglob)[..., None],
+                                 cglob.shape + (C,))
+        if not np.any(owner >= 0):
             return fixed
-        R = geom.quat_to_rot(st['quat'])[:, :, np.maximum(self.owner, 0)]
-        rot = geom.rotate_cov6(R, jnp.asarray(self.cloc)[..., None])
-        return jnp.where((self.owner >= 0)[None, :, None], rot, fixed)
+        R = geom.quat_to_rot(st['quat'])[:, :, np.maximum(owner, 0)]
+        rot = geom.rotate_cov6(R, jnp.asarray(cloc)[..., None])
+        return jnp.where((owner >= 0)[None, :, None], rot, fixed)
+
+    def _model_cov(self, st):
+        return self._cov(st, self.owner, self.cloc, self.cglob)
 
     def _md(self, st):
         """model x data overlaps, distances (n, D, C)"""
@@ -130,8 +134,13 @@ class _EM(Term):
 
 
 class EMIsd(_EM):
-    """isd.GaussianEMRestraint:
-       w * (-log(2 MD / (MM_self + 2 MM_cross + DD)) + slope * sum |m - d|)"""
+    """isd.GaussianEMRestraint(m, model_ps, density_ps, ...):
+       w * (-log(2 MD / (MM_self + 2 MM_cross + DD)) + slope * sum |m - d|)
+
+       MD and MM_cross use current positions (pairs within the cutoffs);
+       MM_self and DD are what C++ cached at construction. Either set may
+       move: the mature NPC protocol passes (data, model), so there the
+       moving "density" is the model and DD is its setup-time overlap."""
     name = 'em_isd'
     TAG = 'IMP.isd.GaussianEMRestraint'
     ARGS = ('model', 'model_ps', 'density_ps', 'global_sigma',
@@ -149,35 +158,51 @@ class EMIsd(_EM):
             raise Unsupported('isd EM backbone_slope / local')
         self.model_pis = imp_hooks.pis(a['model_ps'])
         self.dens_pis = imp_hooks.pis(a['density_ps'])
-        for p in self.model_pis:
+        for p in self.model_pis + self.dens_pis:
             s.row(p)
         self.mcut = a['model_cutoff_dist'] + self.extra
         self.dcut = a['density_cutoff_dist'] + self.extra
         self.slope = a['slope']
         self.w = w * d.get_weight()
+        self.snap = imp_hooks.SNAPSHOTS[int(d.this)]
         self.restraints.append((w, d))
 
     def finalize(self, s):
         self.rows = s.rows(self.model_pis)
+        self.drows = s.rows(self.dens_pis)
         (self.owner, self.cloc, self.cglob, self.mass,
          self.rad) = _gaussians(s, self.model_pis, s.cov_mode)
-        self.dx, self.dc, self.dm, self.drad = _data(s.m, self.dens_pis)
-        dd = geom.gaussian_overlap(
-            self.dx[:, :, None], self.dc[:, :, None], self.dm[:, None],
-            self.dx[:, None], self.dc[:, None], self.dm[None], np)
-        self.dd = float(np.sum(np.asarray(dd)))
+        (self.downer, self.dcloc, self.dcglob, self.dm,
+         self.drad) = _gaussians(s, self.dens_pis, s.cov_mode)
+
+        def snap(ps):
+            x = np.array([self.snap[p][0] for p in ps]).T
+            c = np.array([self.snap[p][1] for p in ps])
+            c6 = np.stack([c[:, 0, 0], c[:, 0, 1], c[:, 0, 2], c[:, 1, 1],
+                           c[:, 1, 2], c[:, 2, 2]])
+            return x, c6, np.array([self.snap[p][2] for p in ps])
+        dx, dc, dm = snap(self.dens_pis)
+        self.dd = float(np.sum(geom.gaussian_overlap(
+            dx[:, :, None], dc[:, :, None], dm[:, None],
+            dx[:, None], dc[:, None], dm[None], np)))
         # self terms depend on det(cov) only, i.e. not on orientation
-        z = np.zeros((3, len(self.mass)))
-        self.self_mm = float(np.sum(np.asarray(geom.gaussian_overlap(
-            z, self.cglob, self.mass, z, self.cglob, self.mass, np))))
+        mx, mc, mm = snap(self.model_pis)
+        self.self_mm = float(np.sum(geom.gaussian_overlap(
+            mx, mc, mm, mx, mc, mm, np)))
         n = len(self.model_pis)
         self.iu = np.triu(np.ones((n, n), bool), 1)
 
     def full(self, st, masks=None):
         """masks: (md (n, D, C), mm (n, n, C)) pair masks to use instead of
            the cutoffs (from cpp_masks, for exact checks)"""
-        xm, cm, ov, d2 = self._md(st)
-        dist = jnp.sqrt(d2)
+        X = st['X']
+        xm, xd = X[:, self.rows], X[:, self.drows]
+        cm = self._cov(st, self.owner, self.cloc, self.cglob)
+        cd = self._cov(st, self.downer, self.dcloc, self.dcglob)
+        ov = geom.gaussian_overlap(
+            xm[:, :, None], cm[:, :, None], self.mass[:, None, None],
+            xd[:, None], cd[:, None], self.dm[None, :, None])
+        dist = geom.norm(xm[:, :, None] - xd[:, None])
         sph = dist - self.rad[:, None, None] - self.drad[None, :, None]
         mdm = sph < self.dcut if masks is None else masks[0]
         md = jnp.sum(jnp.where(mdm, ov, 0.), axis=(0, 1))
@@ -190,8 +215,10 @@ class EMIsd(_EM):
             else masks[1]
         mmx = jnp.sum(jnp.where(mmm, mm, 0.), axis=(0, 1))
         denom = self.self_mm + 2. * mmx + self.dd
-        return self.w * (-jnp.log(2. * md / denom)
-                         + self.slope * jnp.sum(dist, axis=(0, 1)))
+        e = -jnp.log(2. * md / denom)
+        if self.slope:
+            e = e + self.slope * jnp.sum(dist, axis=(0, 1))
+        return self.w * e
 
 
 class EMBayes(_EM):

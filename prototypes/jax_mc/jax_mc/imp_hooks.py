@@ -10,9 +10,29 @@ system.
 import math
 
 RECORDED = {}       # int(this) -> (python proxy, class name, args, kwargs)
+SNAPSHOTS = {}      # int(this) -> {particle index: (xyz, global cov, mass)}
 
+# restraints and scores whose parameters Python can't read back
 _CLASSES = [('IMP.isd', 'GaussianEMRestraint'),
-            ('IMP.bayesianem', 'GaussianEMRestraint')]
+            ('IMP.bayesianem', 'GaussianEMRestraint'),
+            ('IMP.core', 'BoundingBox3DSingletonScore'),
+            ('IMP.npc', 'SlabWithToroidalPoreMBMScore'),
+            ('IMP.npc', 'ToroidalPoreSurfaceDepthPairScore')]
+
+
+def _snapshot(m, ps):
+    """Gaussians as they are now (EM restraints cache terms at setup)"""
+    import numpy as np
+    import IMP
+    import IMP.atom
+    import IMP.core
+    out = {}
+    for p in pis(ps):
+        pp = IMP.ParticleIndex(p)
+        out[p] = (np.array(IMP.core.XYZ(m, pp).get_coordinates()),
+                  np.array(IMP.core.Gaussian(m, pp).get_global_covariance()),
+                  IMP.atom.Mass(m, pp).get_mass())
+    return out
 
 
 def install():
@@ -30,6 +50,10 @@ def install():
         def __init__(self, *args, _orig=orig, _tag=tag, **kw):
             _orig(self, *args, **kw)
             RECORDED[int(self.this)] = (self, _tag, args, kw)
+            if _tag.endswith('GaussianEMRestraint') and len(args) > 2:
+                SNAPSHOTS[int(self.this)] = {
+                    **_snapshot(args[0], args[1]),
+                    **_snapshot(args[0], args[2])}
         cls.__init__ = __init__
         cls._jax_mc_recorded = True
 
