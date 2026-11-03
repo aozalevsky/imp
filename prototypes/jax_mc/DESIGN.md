@@ -1,0 +1,298 @@
+# jax_mc: a core plus recipes for fast, exact JAX Monte Carlo samplers
+
+Status: design, 2026-11-03. Nothing here is implemented yet.
+
+## Why
+
+The Pol II tutorial sampler is fast: 1.16 billion MC steps/s on one L40 with
+agy_imp's plain-JAX version, and 4.6 billion on four. But it got there by
+specializing everything to one system:
+- 2 rigid bodies and 47 beads;
+- a fixed mover order;
+- tuning thresholds for one GPU model;
+- caches that are only valid for one covariance mode.
+
+The other systems got their own samplers, each written from scratch:
+- NPC basket: `npc_sampler2.py`;
+- mature NPC: `pm_sampler2.py`;
+- mzIdentML: IMP's JAX MC with our fused patches.
+
+A test on 2026-11-03 showed that the Pol II techniques don't simply drop
+into these samplers. None of them has the copies those techniques remove, and
+a chain-last vmap gave no gain on the NPC basket. Each sampler is built
+differently: the code is duplicated, and so are the tests and the
+"what's exact" arguments.
+
+We want both:
+- **a solid core** that runs any supported PMI system exactly, readably and
+  reasonably fast, with tests that make changes safe;
+- **recipes and templates:** documented, opt-in specializations with stated
+  preconditions, measured gains and an exactness test, to be adapted or
+  rewritten case by case for maximum speed.
+
+**Non-goals:**
+- a general replacement for IMP's own JAX path (`IMP.core.MonteCarlo` on
+  JAX);
+- supporting every IMP restraint;
+- auto-tuning.
+
+**Anti-goals** (a failure even if it works):
+- a core that is as hard to read as `sampler_soa.py`;
+- recipes that silently assume something about the system;
+- system-specific thresholds or indices inside the core.
+
+## What exists today
+
+| system | sampler | design | one L40 | specific to the system |
+|---|---|---|---|---|
+| Pol II tutorial | `jax_mc_rnapolii/sampler_soa.py` + agy's 5f1778d | incremental; chain-last struct of arrays; unrolled static mover order; static-EV grid; blocked beads; EM cache | 1.16 bn (agy, rescore every 20th frame); 665 M (public, rescore every frame) | 2 bodies, beads only on static bodies, thresholds tuned for the L40, EM cache valid only for `rotate` |
+| NPC basket (yeast) | `jax_mc_npc_basket/.../npc_sampler2.py` | incremental; generic over PMI restraint types; dynamic mover index with per-kind padded tables and `lax.switch`; chain-first vmap | 11.5 M | little: generic inventory of PMI restraints and movers |
+| mature NPC | `pm_sampler2.py` (local) | every step moves all 112 bodies; full energy over neighbour lists (inner and outer skin) | 1.11-1.22 M | the membrane, overall-position and bbox terms; collective moves |
+| mzIdentML tutorial | IMP's JAX MC + `imp_jax_fused` patches | full rescore every step; masked selects | 67-70 M | none (IMP restraint functions) |
+
+All speeds are MC steps/s.
+
+**Where the time goes,** measured on one L40 on 2026-11-03
+(`imp_jax/fig1_agy/NOTES.md`):
+- NPC basket: EV 30%, EM 32%, cheap terms 23%, overhead 22%.
+- mature NPC: neighbour-list rebuilds 28%; the rest is the full energy.
+- mzIdentML: ~12 kernels per step, limited by the work of the full rescore.
+
+## The shape
+
+```
+            IMP model + restraints + movers (PMI)
+                          |
+                   jax_mc.system        extract flat tables (numpy, float64)
+                          |
+       jax_mc.terms    jax_mc.engine    reference incremental sampler
+       (full + delta)  (chain-last, any mover order, no tuning)
+                          |
+         jax_mc.run       drivers: frames, REX ladders, rescore policy,
+                          output (DOF snapshots -> RMF), multi-GPU
+         jax_mc.check     exactness harness: terms vs C++, decisions vs
+                          the engine, drift, ensembles vs C++
+  ---------------------------------------------------------------------
+  recipes/   one page + reference code per technique: preconditions
+             (asserted), gain, test
+  templates/ worked samplers that compose the core with recipes:
+             few_bodies_beads (Pol II), many_movers (NPC basket,
+             mzIdentML), collective (mature NPC)
+```
+
+A system-specific sampler is a template copied and adapted. It keeps using
+`system`, `terms`, `run` and `check`. It replaces, or specializes, the
+engine's step.
+
+## The core
+
+### `jax_mc.system`: what to simulate
+
+This is the host-side extraction from an IMP model into a `System` of flat
+float64 numpy tables:
+- particle rows;
+- rigid bodies, with local coordinates and the initial frame;
+- nuisances, with bounds;
+- movers in SerialMover order: kind, rows, parameters;
+- one entry per scoring term: type, parameters, item lists.
+
+Rules:
+- **A registry of extractors keyed by IMP class.** Anything unsupported
+  raises `Unsupported` with the class name. There are no name-based guesses.
+- **Merge the three extractors we already have:**
+  - `TutSystem` (scoring.py);
+  - the inventory part of `NPCSampler2.__init__` (it already covers
+    harmonic-upper-bound pairs, z-axial, membrane, cross-links, EV, EM,
+    nuisances, ball, rigid-body and translation movers);
+  - `PMSystem` (pm_jax.py: overall position, membrane depth/binding, bbox).
+- **Static analysis lives here, not in samplers.** Examples: which particles
+  never move (the static set), which terms couple which movers, which EM
+  Gaussians belong to which body. Recipes read these facts. They never
+  rederive them.
+
+### `jax_mc.terms`: how to score
+
+Each scoring term is one small class with three parts:
+
+```python
+class Term:
+    def tables(self, system): ...        # device arrays, built once
+    def full(self, st): ...              # (C,) energy per chain [+ cache]
+    def delta(self, kind, j, st, new): ... # (C,) energy change for mover j
+                                           # [+ cache update on accept]
+```
+
+They are written once for the chain-last layout, readable, and tested in
+float64 against the C++ restraint they replace. Per-term caches (EM block
+sums, per-bead static EV) are part of the chain state and are updated by
+masked select on accept.
+
+The first set covers the four systems:
+- connectivity;
+- excluded volume;
+- cross-links (CrossLinkMS);
+- Gaussian EM;
+- z-axial;
+- membrane;
+- overall position;
+- bbox;
+- nuisance priors.
+
+### `jax_mc.engine`: the reference sampler
+
+- **State layout:** chain-last, written that way natively. Coordinates are
+  `(3, rows, C)` and frames are `(4, bodies, C)`.
+  - A `vmap` with `in_axes=-1` is not enough: XLA compiles the same loop as
+    with chains first (measured on the NPC basket).
+  - Chain-last is part of what made the Pol II struct-of-arrays sampler twice
+    as fast on GPU (with the static-EV grid and no array copies).
+- **Sweep:** a `lax.scan` over the movers in SerialMover order, with per-kind
+  padded tables and `lax.switch` on the kind, as in `npc_sampler2`. This works
+  for any number of movers, and compile time doesn't grow with it.
+- **Write-back:** a masked select into the moved rows. Each mover's rows are
+  contiguous where the system allows; `system` orders rows by mover.
+- **Not in the engine:**
+  - no thresholds tuned to a GPU or a system;
+  - no unrolling;
+  - no caches that hold only under conditions the engine doesn't check.
+
+**Random numbers (a contract for every sampler built on the core).**
+- **The draws:**
+  - for chain c, sweep s: `k = fold_in(chain_key[c], s)`;
+  - `U = uniform(k, (n_movers, 8))`;
+  - `Z = normal(fold_in(k, 1), (n_movers,))`.
+- **The columns** of mover i's row:
+  - 0-2: ball or translation;
+  - 3-6: rotation axis and angle;
+  - 7: Metropolis;
+  - `Z[i]`: nuisance.
+- **Slicing is allowed** if the draws stay bitwise equal: generate the full
+  shape, then slice (agy's sliced RNG does this).
+- **Per-sweep `fold_in`** gives random access, so blocked and unrolled
+  samplers can consume the same numbers.
+
+Every template must use the same draws as the engine. That is what makes
+"same decisions as the engine" testable.
+
+### `jax_mc.run`: drivers
+
+These are taken from `run_soa.py`, `run_mpi.py`, `fast_dofs.py` and
+`dofs_to_rmf.py`:
+- frames of N sweeps in device-side blocks;
+- REX ladders;
+- the rescore policy (every frame, or recorded frames only);
+- DOF snapshots written from a thread, with RMF made afterwards;
+- one process per GPU;
+- `--cpi/--cpt/--maxh` checkpointing (from the NPC work).
+
+### `jax_mc.check`: the exactness harness
+
+Exactness has four levels. Every sampler states which ones it meets.
+
+| level | meaning | how it's checked |
+|---|---|---|
+| T (terms) | each term equals C++ to float64 round-off at random states | `check.terms(system)`: IMP `evaluate` against `Term.full`, all terms, all four systems |
+| D (decisions) | same accept/reject decisions as the engine for N sweeps, same draws, float64 | `check.decisions(a, b, sweeps, chains, kTs)`. Covers more than one chain-count regime (≤ 2,048 and > 4,096), kT 1 and kT where acceptance is about 50%. **Every recipe must pass it against the engine.** |
+| F (float32) | in float32, the fraction of flipped decisions and the tracked-vs-rescore drift are reported and bounded | `check.drift`, `check.decisions(..., dtype=float32)` |
+| E (ensembles) | complete runs agree with C++ in final scores and structure statistics | `check.ensembles` (from `compare_final.py`) |
+
+**Note.** "Bit-for-bit identical" is only claimed when the operation order is
+the same. Recipes that reorder sums, like blocking, cached parts or
+`d*(s/n)`, claim level D, not bitwise equality.
+
+## Recipes
+
+One page each in `recipes/`, in a fixed format:
+- what it does;
+- **preconditions, each enforced by an assert** in the reference code;
+- the measured gain, on which system and GPU;
+- the exactness level it keeps, and the `check` call that proves it;
+- the reference code, a small function, not a sampler.
+
+| # | recipe | preconditions | measured |
+|---|---|---|---|
+| R1 | static/movable split; static EV as a packed (x, y, z, r) grid with a compact cell list | a static set exists (from `system`); cell indices fit the index type (assert) | Pol II: 369 to ≤21 candidates per query, part of the 2× on one L40; NPC basket: 351 of 774 EV particles static (gain estimated ≤10%) |
+| R2 | unrolled sweep with static row offsets; in-place `dynamic_update_slice` behind `optimization_barrier`; flat tuple carry | few movers (compile time; 49 fine, 354 untested); contiguous rows per mover | agy: ~100-280 copy kernels per sweep removed (Pol II) |
+| R3 | blocked bead steps (score B consecutive beads in one reduction, correct within the block) | consecutive bead movers with consecutive rows; every coupling term has a within-block correction; no EM on beads | agy: ~340 to ~28 kernel launches per sweep; GPU only, 19% slower on one CPU core |
+| R4 | per-body EM cache (model-data sums; intra-body overlap computed once per call) | covariances rotate with the body (`rotate`), **not** `frozen`; any number of bodies; EM Gaussians only on rigid bodies | Pol II, one CPU core, float64: R1 and R4-R7 together +23% |
+| R5 | closed-form 6-component covariances; elementwise 3×3 products | none | removes TF32 error on GPU (max 2.1 kT to 2.6e-4 kT); fewer intermediates |
+| R6 | sweep-wide precompute of bead proposals' static terms | one move per bead per sweep, in bead order (assert); the static set is truly static | Pol II, one CPU core: part of that +23% |
+| R7 | sliced RNG | follows the random-number contract | Pol II: 48% fewer RNG writes |
+| R8 | neighbour lists with inner and outer skins; rebuild of a single chain inside the step | collective moves; bounded displacement per step | mature NPC: rebuilds are 28% of the step, about 0.29 ms each |
+| R9 | masked select instead of scatter for the write-back | small arrays (rows × chains); large arrays prefer scatter | mzIdentML uses it; the NPC basket chose scatters on purpose |
+| R10 | full rescore only on recorded frames | the tracked energy's drift is checked on the recorded frames | Pol II: 1.06-1.16 bn instead of 0.93-1.0 bn on one L40 |
+| R11 | device-side frame blocks, pipelined host output, DOF snapshots with RMF afterwards | none | Pol II: 1,024 runs in 3.1 min, against 3.5 min for the prototype |
+| R12 | hand-written fused kernel (Pallas/Triton) | last resort; not maintained | Pol II: 4.19 bn on 4 L40s, now matched by plain JAX (R1-R7) |
+| R13 | precision: float32 with drift checks; not bf16, not TF32 | none | bf16: ~6 kT error, 6% flipped decisions, no speedup |
+
+The review of agy's code on 2026-11-03 turned into preconditions above:
+- R4 is `rotate` only, and doesn't assume 2 bodies;
+- R1 needs the index range check;
+- R3 and R6 need the bead-order assert.
+
+## Templates
+
+A template is a complete sampler that a person or an agent copies and
+adapts. Each one has:
+- a `README.md` with the system shape it fits and the recipes it uses;
+- a benchmark script;
+- a `check` script that runs levels T and D (plus F for float32).
+
+| template | system shape | starts from | recipes | target on one L40 |
+|---|---|---|---|---|
+| `few_bodies_beads` | few rigid bodies, many beads, fixed mover order (Pol II) | agy's `sampler_soa.py`, moved onto `system`, `terms` and the random-number contract, with the review fixes | R1-R7, R10, R11 | agy's 1.16 bn, now with D against the engine |
+| `many_movers` | hundreds of movers, generic PMI terms (NPC basket, mzIdentML) | the engine plus R1, R5 and R9 | R1, R5, R9-R11 | NPC basket > 11.5 M; mzIdentML > 67 M (incremental instead of full rescore) |
+| `collective` | every step moves every body (mature NPC) | `pm_sampler2.py`, moved onto `system`, `terms` and `run`, with its own step | R8, R10, R11 | ≥ 1.2 M; then batch or fuse the rebuilds |
+
+## Acceptance
+
+- **Level T** passes on all four systems from the IMP model, with no
+  system-specific code outside `system` extractors and `terms`.
+- **The engine runs Pol II, the NPC basket and mzIdentML.** On one L40:
+  - NPC basket: at least `npc_sampler2`'s speed;
+  - mzIdentML: at least 67 M;
+  - Pol II: within 2× of `few_bodies_beads`.
+- **`few_bodies_beads`** reaches agy's speed and passes level D against the
+  engine in float64, in both chain-count regimes.
+- **Every recipe** has its `check` call in one test script, which runs on a
+  GPU node in under 30 minutes.
+- **Documentation:** a "make a fast sampler for your system" page that walks
+  through choosing a template, then adding recipes one at a time, checking D
+  after each.
+
+## Order of work
+
+1. **`system` + `terms` + `check.terms`** for the four systems, reusing the
+   three extractors and the existing term code. This is useful even if the
+   rest changes.
+2. **`engine` + `check.decisions` + the random-number contract.** Benchmark
+   against today's samplers on one L40.
+3. **`few_bodies_beads`:** port agy's sampler onto the core and fix the review
+   items. Write recipes R1-R7 from it.
+4. **`many_movers` and `collective`;** recipes R8-R11.
+5. **The guide;** clean up the old prototype directories, which keep working
+   until the templates replace them.
+
+## Decisions taken without asking (change any)
+
+- **Location:** `prototypes/jax_mc/` on a local branch, `jax_mc_core`, of
+  the fork. Nothing is pushed. The old `jax_mc_rnapolii` and
+  `jax_mc_npc_basket` stay as they are until the templates match them.
+- **Plain JAX only in the core.** Pallas stays a recipe.
+- **The engine's sweep is dynamic** (scan + switch), not unrolled.
+  Unrolling is recipe R2.
+- **The random-number contract** (`fold_in` per sweep, (n_movers, 8)
+  uniforms). The existing Pol II and NPC samplers draw differently, so their
+  old trajectories won't be reproduced. Level D is checked between samplers
+  on the core.
+- **mzIdentML moves from IMP's full-rescore path to the incremental engine.**
+  Its Fig 1 number stays as the "IMP JAX path" reference.
+
+## Open questions for Ben
+
+- Long term, should the core stay a prototype directory or become part of
+  IMP? For example, `IMP.jax` gaining an incremental sampler that reads
+  per-restraint `delta` functions.
+- Should IMP restraints expose a JAX `delta` next to their JAX score
+  function, so that `system` and `terms` don't need their own copies of the
+  math?
