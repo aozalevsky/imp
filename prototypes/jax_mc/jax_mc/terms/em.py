@@ -10,6 +10,10 @@ global covariance.
 Both restraints keep close-pair lists with slack in C++, so pairs a little
 beyond the cutoff may or may not count there, depending on the list's
 history (salilab/imp#1121). `extra` widens the cutoff here.
+
+For the incremental engine both terms cache their pair sums per chain
+(isd: MD, MM cross and the slope sum; bayesianem: the per-density MD sums
+and the slope sum) and update them with the moved Gaussians' change.
 """
 import math
 
@@ -17,9 +21,9 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-from . import Term, geom
+from . import Term, geom, pad, slots
 from .. import imp_hooks
-from ..system import Unsupported
+from ..system import STATIC, Unsupported
 
 
 def _gaussians(s, pis, cov_mode):
@@ -121,6 +125,23 @@ class _EM(Term):
     def _model_cov(self, st):
         return self._cov(st, self.owner, self.cloc, self.cglob)
 
+    def _covs(self, q, st, mv=None, mbslot=None):
+        """covariances (6, len(q), C or 1) of model Gaussians q, before the
+           move mv or after it (mbslot: per Gaussian, the slot of its owner
+           among the mover's bodies, -1: not moved)"""
+        fixed = jnp.asarray(self.cglob)[:, q][..., None]
+        if not np.any(self.owner >= 0):
+            return fixed
+        own = jnp.asarray(self.owner)[q]
+        quat = st['quat'][:, jnp.maximum(own, 0)]
+        if mv is not None and mv.q_new is not None:
+            bs = mbslot[q]
+            quat = jnp.where((bs >= 0)[None, :, None],
+                             mv.q_new[:, jnp.maximum(bs, 0)], quat)
+        rot = geom.rotate_cov6(geom.quat_to_rot(quat),
+                               jnp.asarray(self.cloc)[:, q][..., None])
+        return jnp.where((own >= 0)[None, :, None], rot, fixed)
+
     def _md(self, st):
         """model x data overlaps, distances (n, D, C)"""
         xm = st['X'][:, self.rows]                          # (3, n, C)
@@ -132,6 +153,35 @@ class _EM(Term):
         v = xm[:, :, None] - self.dx[:, None, :, None]
         d2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2]
         return xm, cm, ov, d2
+
+    def move_tables(self, s, moves):
+        """the mover's model Gaussians (a: index, aslot: slot), and per
+           model Gaussian its slot (mslot) and its owner's slot among the
+           mover's bodies (mbslot), -1 if not moved"""
+        n = len(self.rows)
+        a_l, as_l, ms_l, mb_l = [], [], [], []
+        for rows, bodies in moves:
+            slot = slots(rows)
+            ms = np.array([slot.get(int(r), -1) for r in self.rows])
+            a = np.nonzero(ms >= 0)[0]
+            bpos = {int(b): k for k, b in enumerate(bodies)}
+            a_l.append(a)
+            as_l.append(ms[a])
+            ms_l.append(ms)
+            mb_l.append([bpos.get(int(o), -1) if o >= 0 else -1
+                         for o in self.owner])
+        return dict(a=pad(a_l, n), aslot=pad(as_l, 0),
+                    mslot=pad(ms_l, -1, n), mbslot=pad(mb_l, -1, n))
+
+    def _moved(self, tab, st, mv):
+        """positions and covariances of the moved model Gaussians before
+           and after the move"""
+        n = len(self.rows)
+        a = tab['a']
+        aa = jnp.minimum(a, n - 1)
+        sl = tab['aslot']
+        return (a < n, aa, mv.Xo[:, sl], mv.Xn[:, sl], self._covs(aa, st),
+                self._covs(aa, st, mv, tab['mbslot']))
 
 
 class EMIsd(_EM):
@@ -192,10 +242,16 @@ class EMIsd(_EM):
             mx, mc, mm, mx, mc, mm, np)))
         n = len(self.model_pis)
         self.iu = np.triu(np.ones((n, n), bool), 1)
+        self.rows_read = np.unique(np.concatenate([self.rows, self.drows]))
+        self.nuis_read = np.zeros(0, np.int64)
+        # static density particles: one copy for all chains (delta)
+        self.dx0 = s.row_xyz0[self.drows].T if np.all(
+            s.row_kind[self.drows] == STATIC) else None
 
-    def full(self, st, masks=None):
-        """masks: (md (n, D, C), mm (n, n, C)) pair masks to use instead of
-           the cutoffs (from cpp_masks, for exact checks)"""
+    def _sums(self, st, masks=None):
+        """MD, MM cross, slope sum (C,) each. masks: (md (n, D, C),
+           mm (n, n, C)) pair masks to use instead of the cutoffs (from
+           cpp_masks, for exact checks)"""
         X = st['X']
         xm, xd = X[:, self.rows], X[:, self.drows]
         cm = self._cov(st, self.owner, self.cloc, self.cglob)
@@ -215,18 +271,89 @@ class EMIsd(_EM):
         mmm = (self.iu[..., None] & (sphm < self.mcut)) if masks is None \
             else masks[1]
         mmx = jnp.sum(jnp.where(mmm, mm, 0.), axis=(0, 1))
-        denom = self.self_mm + 2. * mmx + self.dd
-        e = -jnp.log(2. * md / denom)
+        sl = jnp.sum(dist, axis=(0, 1)) if self.slope else jnp.zeros_like(md)
+        return dict(md=md, mmx=mmx, sl=sl)
+
+    def _energy(self, c):
+        e = -jnp.log(2. * c['md'] / (self.self_mm + 2. * c['mmx'] + self.dd))
         if self.slope:
-            e = e + self.slope * jnp.sum(dist, axis=(0, 1))
+            e = e + self.slope * c['sl']
         return self.w * e
+
+    def full(self, st, masks=None):
+        return self._energy(self._sums(st, masks))
+
+    def cache(self, st):
+        return self._sums(st)
+
+    def move_tables(self, s, moves):
+        for rows, _ in moves:
+            if np.isin(self.drows, rows).any():
+                raise Unsupported('isd EM with moving density particles '
+                                  '(collective template)')
+        return super().move_tables(s, moves)
+
+    def delta(self, tab, st, cache, mv):
+        """moved Gaussians against the density, and against all model
+           Gaussians (pairs among moved ones once each: with frozen
+           covariances a rigid move still changes their overlap)"""
+        n = len(self.rows)
+        ok, aa, xo, xn, co, cn = self._moved(tab, st, mv)
+        ma, ra = jnp.asarray(self.mass)[aa], jnp.asarray(self.rad)[aa]
+        X = st['X']
+        xd = X[:, self.drows] if self.dx0 is None else \
+            jnp.asarray(self.dx0)[..., None]
+        cd = jnp.asarray(self.dcglob)[..., None]
+
+        def md(x, c):
+            ov = geom.gaussian_overlap(
+                x[:, :, None], c[:, :, None], ma[:, None, None],
+                xd[:, None], cd[:, None], self.dm[None, :, None])
+            dist = geom.norm(x[:, :, None] - xd[:, None])
+            sph = dist - ra[:, None, None] - self.drad[None, :, None]
+            m = ok[:, None, None] & (sph < self.dcut)
+            sl = jnp.sum(jnp.where(ok[:, None, None], dist, 0.),
+                         axis=(0, 1)) if self.slope else 0.
+            return jnp.sum(jnp.where(m, ov, 0.), axis=(0, 1)), sl
+
+        ms = tab['mslot']
+        allq = np.arange(n)
+        xall_o, xall_n = X[:, self.rows], mv.pos(jnp.asarray(self.rows), ms)
+        call_o = self._covs(allq, st)
+        call_n = self._covs(allq, st, mv, tab['mbslot'])
+        pair = ok[:, None] & ((ms[None] < 0) | (aa[:, None] < allq[None]))
+
+        def mm(x, c, xall, call):
+            ov = geom.gaussian_overlap(
+                x[:, :, None], c[:, :, None], ma[:, None, None],
+                xall[:, None], call[:, None], self.mass[None, :, None])
+            sph = geom.norm(x[:, :, None] - xall[:, None]) \
+                - (ra[:, None] + self.rad[None])[..., None]
+            return jnp.sum(jnp.where(pair[..., None] & (sph < self.mcut),
+                                     ov, 0.), axis=(0, 1))
+
+        mdo, slo = md(xo, co)
+        mdn, sln = md(xn, cn)
+        new = dict(md=cache['md'] + mdn - mdo,
+                   mmx=cache['mmx'] + mm(xn, cn, xall_n, call_n)
+                   - mm(xo, co, xall_o, call_o),
+                   sl=cache['sl'] + sln - slo)
+        return self._energy(new) - self._energy(cache), new
 
 
 class EMBayes(_EM):
     """bayesianem.GaussianEMRestraint (log-normal on per-density overlap
-       ratios, with a sigma nuisance and a nearest-center slope term)"""
+       ratios, with a sigma nuisance and a nearest-center slope term).
+
+       The per-density sums are kept as sums over blocks of BLOCK
+       consecutive model Gaussians, and a move recomputes the blocks it
+       touches from positions. Updating the sums by adding and subtracting
+       overlaps instead is not safe in float32: a density with no model
+       nearby has a sum near 0 next to single overlaps of order 10, and the
+       energy depends on log(sum + 1e-10)."""
     name = 'em_bayes'
     TAG = 'IMP.bayesianem.GaussianEMRestraint'
+    BLOCK = 16
 
     def __init__(self, key, extra=0.):
         super().__init__(key)
@@ -257,6 +384,8 @@ class EMBayes(_EM):
         self.restraints.append((w, d))
 
     def finalize(self, s):
+        # row order, so that a mover's Gaussians share few blocks
+        self.model_pis = sorted(self.model_pis, key=lambda p: s.row_of[p])
         self.rows = s.rows(self.model_pis)
         self.sig = s.nuis_of[self.sigma_pi]
         (self.owner, self.cloc, self.cglob, self.mass,
@@ -270,26 +399,128 @@ class EMBayes(_EM):
         self.cached = (np.sum(np.log(self.sdd)) + (3.0 + nd) / 2.0
                        * math.log(2.0) + 0.5 * math.log(math.pi)
                        - math.lgamma(nd / 2.0))
+        n, B = len(self.rows), self.BLOCK
+        blk = np.arange(-(-n // B) * B).reshape(-1, B)
+        self.blk = np.where(blk < n, blk, n)                # (nblk, B)
+        self.rows_read = self.rows
+        self.nuis_read = np.array([self.sig], np.int64)
 
-    def full(self, st, masks=None):
-        """masks: (md (n, D, C), _) model x data pair mask to use instead of
-           the cutoff (from cpp_masks, for exact checks)"""
-        xm, cm, ov, d2 = self._md(st)
-        sph = jnp.sqrt(d2) - self.rad[:, None, None] \
-            - self.drad[None, :, None]
-        mdm = sph < self.cut if masks is None else masks[0]
-        sdm = jnp.sum(jnp.where(mdm, ov, 0.), axis=0)              # (D, C)
-        scale = st['nuis'][self.sig]
-        lt = jnp.log(scale * (sdm + 1e-10) / (self.sdd[:, None] + 1e-10))
+    def _slope(self, x):
+        """distance (..., C) from Gaussians x (3, ..., C) to the nearest
+           density center. From a barrier'd copy: reducing the same
+           distances over the density axis here and over the Gaussian axis
+           for the overlaps would keep XLA GPU from fusing either reduction
+           with its producer."""
+        xb = jax.lax.optimization_barrier(x)
+        v = xb[..., None, :] - self.dx.reshape((3,) + (1,) * (x.ndim - 2)
+                                               + (-1, 1))
+        return jnp.sqrt(jnp.min(v[0] * v[0] + v[1] * v[1] + v[2] * v[2],
+                                axis=-2))
+
+    def _blocks(self, q, x, c):
+        """per-block sums for blocks of Gaussians q (K, B) (n: padding) at
+           x (3, K, B, C) with covariances c (6, K, B, C or 1): MD sums
+           (K, D, C) and slope sums (K, C)"""
+        n = len(self.rows)
+        ok = q < n
+        qq = jnp.minimum(q, n - 1)
+        ma, ra = jnp.asarray(self.mass)[qq], jnp.asarray(self.rad)[qq]
+        dx = self.dx[:, None, None, :, None]
+        ov = geom.gaussian_overlap(
+            x[..., None, :], c[..., None, :], ma[..., None, None],
+            dx, self.dc[:, None, None, :, None], self.dm[:, None])
+        v = x[..., None, :] - dx
+        sph = jnp.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]) \
+            - ra[..., None, None] - self.drad[:, None]
+        m = ok[..., None, None] & (sph < self.cut)
+        bs = jnp.sum(jnp.where(m, ov, 0.), axis=1)
+        if self.slope > 0.:
+            bsl = jnp.sum(jnp.where(ok[..., None], self._slope(x), 0.), axis=1)
+        else:
+            bsl = jnp.zeros_like(bs[:, 0])
+        return bs, bsl
+
+    def _sums(self, st, masks=None):
+        """per-density MD sums sdm (D, C) and the slope sum sl (C,), with
+           their per-block parts. masks: (md (n, D, C), _) model x data pair
+           mask to use instead of the cutoff (from cpp_masks, for exact
+           checks; no blocks)"""
+        if masks is not None:
+            xm, cm, ov, d2 = self._md(st)
+            sdm = jnp.sum(jnp.where(masks[0], ov, 0.), axis=0)
+            sl = jnp.sum(self._slope(xm), axis=0) if self.slope > 0. else \
+                jnp.zeros_like(sdm[0])
+            return dict(sdm=sdm, sl=sl)
+        qq = np.minimum(self.blk, len(self.rows) - 1)
+        bs, bsl = self._blocks(self.blk, st['X'][:, self.rows[qq]],
+                               self._covs(qq, st))
+        return dict(bs=bs, bsl=bsl, sdm=jnp.sum(bs, axis=0),
+                    sl=jnp.sum(bsl, axis=0))
+
+    def _energy(self, c, nuis):
+        scale = nuis[self.sig]
+        lt = jnp.log(scale * (c['sdm'] + 1e-10) / (self.sdd[:, None] + 1e-10))
         nd = len(self.dens_pis)
         e = nd * 0.5 * jnp.log(jnp.sum(lt * lt, axis=0)) + self.cached
         if self.slope > 0.:
-            # recomputed from a barrier'd copy: reducing d2 over axis 1 here
-            # and over axis 0 above would keep XLA GPU from fusing either
-            # reduction with its producer, materializing (n, D, C)
-            xb = jax.lax.optimization_barrier(xm)
-            v = xb[:, :, None] - self.dx[:, None, :, None]
-            dsl = v[0] * v[0] + v[1] * v[1] + v[2] * v[2]
-            e = e + self.slope * jnp.sum(jnp.sqrt(jnp.min(dsl, axis=1)),
-                                         axis=0)
+            e = e + self.slope * c['sl']
         return self.w * e
+
+    def full(self, st, masks=None):
+        return self._energy(self._sums(st, masks), st['nuis'])
+
+    def cache(self, st):
+        return self._sums(st)
+
+    def move_tables(self, s, moves):
+        """blocks with a moved Gaussian (aff), the slots of their Gaussians
+           (bslot, -1: not moved), each block's place in aff (bmap, -1: not
+           touched), and per Gaussian its owner's slot among the mover's
+           bodies (mbslot)"""
+        t = super().move_tables(s, moves)
+        nblk = len(self.blk)
+        ms = np.concatenate([t['mslot'], np.full((len(moves), 1), -1)], 1)
+        aff = [np.unique(np.nonzero(m[:-1] >= 0)[0] // self.BLOCK)
+               for m in ms]
+        aff = pad(aff, nblk)
+        bslot = np.stack([m[self.blk[np.minimum(a, nblk - 1)]]
+                          for m, a in zip(ms, aff)])
+        bslot[aff >= nblk] = -1
+        bmap = np.full((len(moves), nblk), -1, np.int64)
+        for i, a in enumerate(aff):
+            for k, b in enumerate(a):
+                if b < nblk:
+                    bmap[i, b] = k
+        return dict(aff=aff, bslot=bslot, bmap=bmap, mbslot=t['mbslot'])
+
+    def delta(self, tab, st, cache, mv):
+        n, nblk = len(self.rows), len(self.blk)
+        aff = tab['aff']
+        q = jnp.asarray(self.blk)[jnp.minimum(aff, nblk - 1)]
+        q = jnp.where((aff < nblk)[:, None], q, n)          # (K, B)
+        qq = jnp.minimum(q, n - 1)
+        x = mv.pos(jnp.asarray(self.rows)[qq], tab['bslot'])
+        bs_n, bsl_n = self._blocks(q, x, self._covs(qq, st, mv,
+                                                    tab['mbslot']))
+        bm = tab['bmap']
+        hit, k = bm >= 0, jnp.maximum(bm, 0)
+        sdm = jnp.sum(jnp.where(hit[:, None, None], bs_n[k], cache['bs']),
+                      axis=0)
+        sl = jnp.sum(jnp.where(hit[:, None], bsl_n[k], cache['bsl']), axis=0)
+        new = dict(cache, sdm=sdm, sl=sl)
+        dE = self._energy(new, st['nuis']) - self._energy(cache, st['nuis'])
+
+        def commit(acc):
+            a = jnp.minimum(aff, nblk - 1)
+            return dict(
+                bs=cache['bs'].at[aff].set(jnp.where(
+                    acc, bs_n, cache['bs'][a]), mode='drop'),
+                bsl=cache['bsl'].at[aff].set(jnp.where(
+                    acc, bsl_n, cache['bsl'][a]), mode='drop'),
+                sdm=jnp.where(acc, sdm, cache['sdm']),
+                sl=jnp.where(acc, sl, cache['sl']))
+        return dE, commit
+
+    def delta_nuis(self, st, cache, nuis):
+        return self._energy(cache, nuis) - self._energy(cache, st['nuis']), \
+            None

@@ -3,11 +3,11 @@ surface location (math as IMP::npc, consider_radius off as PMI sets it)."""
 import numpy as np
 import jax.numpy as jnp
 
-from . import Term
+from . import RowTerm
 from .. import imp_hooks
 
 
-class _PerParticle(Term):
+class _PerParticle(RowTerm):
     CLS = None
 
     @classmethod
@@ -39,11 +39,12 @@ class ZAxial(_PerParticle):
     def params(info):
         return (info['lower bound'], info['upper bound'])
 
-    def full(self, st):
-        z = st['X'][2, self.rows]                       # (n, C)
-        lo = jnp.minimum(z - self.par[:, 0, None], 0.)
-        up = jnp.maximum(z - self.par[:, 1, None], 0.)
-        return jnp.sum(self.w[:, None] * (lo * lo + up * up), axis=0)
+    def energies(self, q, x):
+        par, w = jnp.asarray(self.par)[q], jnp.asarray(self.w)[q]
+        z = x[2]                                        # (n, C)
+        lo = jnp.minimum(z - par[:, 0, None], 0.)
+        up = jnp.maximum(z - par[:, 1, None], 0.)
+        return w[:, None] * (lo * lo + up * up)
 
 
 class MembraneSurface(_PerParticle):
@@ -55,9 +56,10 @@ class MembraneSurface(_PerParticle):
         return (info['major radius'], info['minor radius'],
                 info['thickness'])
 
-    def full(self, st):
-        x, y, z = st['X'][:, self.rows]
-        R, r, h = (self.par[:, i, None] for i in range(3))
+    def energies(self, q, xyz):
+        par, w = jnp.asarray(self.par)[q], jnp.asarray(self.w)[q]
+        x, y, z = xyz
+        R, r, h = (par[:, i, None] for i in range(3))
         dxy = jnp.sqrt(x * x + y * y)
         safe = jnp.where(dxy > 1e-9, dxy, 1.)
         dtx = jnp.where(dxy > 1e-9, x - x / safe * R, x - R)
@@ -65,5 +67,4 @@ class MembraneSurface(_PerParticle):
         inside = jnp.sqrt(z * z + dtx * dtx + dty * dty) - r
         outside = jnp.abs(z) - r
         d = jnp.where(dxy < R, inside, outside)
-        return jnp.sum(self.w[:, None] * jnp.where(jnp.abs(d) > h, d * d, 0.),
-                       axis=0)
+        return w[:, None] * jnp.where(jnp.abs(d) > h, d * d, 0.)

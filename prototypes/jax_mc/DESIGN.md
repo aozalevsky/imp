@@ -1,7 +1,8 @@
 # jax_mc: a core plus recipes for fast, exact JAX Monte Carlo samplers
 
-Status, 2026-11-03: step 1 is done (`system`, `terms`, `check.terms`; see
-[Progress](#progress)). The engine and the templates are not written yet.
+Status, 2026-11-03: steps 1 and 2 are done (`system`, `terms`, `engine`,
+`check.terms`, `check.decisions`, `check.drift`, `bench`; see
+[Progress](#progress)). The templates are not written yet.
 
 ## Why
 
@@ -113,20 +114,32 @@ Rules:
 
 ### `jax_mc.terms`: how to score
 
-Each scoring term is one small class with three parts:
+Each scoring term is one small class:
 
 ```python
 class Term:
-    def tables(self, system): ...        # device arrays, built once
-    def full(self, st): ...              # (C,) energy per chain [+ cache]
-    def delta(self, kind, j, st, new): ... # (C,) energy change for mover j
-                                           # [+ cache update on accept]
+    rows_read, nuis_read                  # what it reads (engine skips
+                                          # terms a mover can't change)
+    def full(self, st): ...               # (C,) energy per chain
+    def cache(self, st): ...              # per-chain partial sums, or None
+    def move_tables(self, s, moves): ...  # host tables, one row per mover
+    def delta(self, tab, st, cache, mv): ...      # (dE (C,), new)
+    def delta_nuis(self, st, cache, nuis): ...    # the same, nuisance move
 ```
 
+`new` is `None` (cache unchanged), a new cache (the engine keeps it where
+the move is accepted), or `commit(acc)`, which updates a large cache in
+place by masked scatter. The defaults for `delta` and `delta_nuis` rescore
+the term with the move applied. That is exact and slow, and only allowed
+for terms without a cache; the IMP JAX fallback uses it.
+
 They are written once for the chain-last layout, readable, and tested in
-float64 against the C++ restraint they replace. Per-term caches (EM block
-sums, per-bead static EV) are part of the chain state and are updated by
-masked select on accept.
+float64 against the C++ restraint they replace. Every mover is rigid on
+its rows (one bead, one body, or a TransformMover's group), so pair terms
+only score pairs with exactly one end moved. The exception is EM with
+frozen covariances, where a rotation changes the overlap of two Gaussians
+on the same body. Terms made of one particle per item share
+`RowTerm`.
 
 The first set covers the four systems:
 - connectivity;
@@ -141,33 +154,54 @@ The first set covers the four systems:
 
 ### `jax_mc.engine`: the reference sampler
 
-- **State layout:** chain-last, written that way natively. Coordinates are
-  `(3, rows, C)` and frames are `(4, bodies, C)`.
+- **State layout:** chain-last, written that way natively. `X (3, rows,
+  C)`, `quat (4, bodies, C)`, `nuis (N, C)`, the energy per term `E (T, C)`,
+  the term caches, `kT (C,)` (so REX ladders need nothing special),
+  per-chain keys, the sweep count and accepted moves per mover. Beads'
+  degrees of freedom are their rows of `X`. A body's translation is its
+  center row (the first member, at local 0), so nothing is stored twice.
   - A `vmap` with `in_axes=-1` is not enough: XLA compiles the same loop as
     with chains first (measured on the NPC basket).
   - Chain-last is part of what made the Pol II struct-of-arrays sampler twice
     as fast on GPU (with the static-EV grid and no array copies).
-- **Sweep:** a `lax.scan` over the movers in SerialMover order, with per-kind
-  padded tables and `lax.switch` on the kind, as in `npc_sampler2`. This works
-  for any number of movers, and compile time doesn't grow with it.
-- **Write-back:** a masked select into the moved rows. Each mover's rows are
-  contiguous where the system allows; `system` orders rows by mover.
+- **Sweep:** a `lax.scan` over the movers in SerialMover order. Movers are
+  grouped by kind (`ball`, `rb`, `transform`, `normal`) and size: the
+  number of rows, padded to a power of 2. Each group has its tables, one
+  row per mover, and its branch of a `lax.switch`. A branch:
+  1. proposes;
+  2. asks the terms its group can change for `delta`;
+  3. applies Metropolis;
+  4. writes the moved rows back with a masked select (`X.at[:,
+     rows].set(where(acc, new, old))`), and updates `E` and the caches.
+
+  This works for any number of movers, and compile time grows with the
+  number of groups, not movers.
+- **`Engine(s, incremental=False)`** is the same sampler with every term
+  rescored from scratch after each proposal. It shares the proposals and
+  draws, and is the reference for `check.decisions`.
+- **Static particles** are read from one copy shared by all chains in the
+  EV and isd EM deltas. Pol II: 369 of 453 EV particles are static.
 - **Not in the engine:**
   - no thresholds tuned to a GPU or a system;
   - no unrolling;
   - no caches that hold only under conditions the engine doesn't check.
 
 **Random numbers (a contract for every sampler built on the core).**
-- **The draws,** for chain c, sweep s:
+- **The draws,** for chain c, sweep s, in the run's dtype:
+  - `chain_key[c] = fold_in(key(seed), c)`;
   - `k = fold_in(chain_key[c], s)`;
   - `U = uniform(k, (n_movers, 3))`;
   - `Z = normal(fold_in(k, 1), (n_movers, 6))`.
 - **Mover i uses its row.**
-  - Ball, or translation: direction `Z[i, 0:3]` normalized, radius from
-    `U[i, 0]` (r = R u^(1/3)).
-  - Rotation: axis `Z[i, 3:6]` normalized, angle from `U[i, 1]`.
-  - Metropolis: `U[i, 2]`.
-  - Nuisance: `Z[i, 0]`.
+  - Ball, or translation: `Z[i, 0:3] / |Z[i, 0:3]| * step *
+    cbrt(U[i, 0])`, in global coordinates. Balls on a static body's local
+    coordinates (Pol II) use it too: the distribution is the same.
+  - Rotation: axis `Z[i, 3:6]` normalized, angle `max_rot * (2 U[i, 1] -
+    1)`, then `q' = normalize(q_axis_angle * q)`.
+  - TransformMover: about IMP's center (beads, plus body centers weighted
+    by their number of members).
+  - Nuisance: `clip(x + sigma * Z[i, 0], lower, upper)`.
+  - Metropolis: accept if `U[i, 2] < exp(-dE / kT)`.
 
   This is the shape agy_imp proposed (forum #imp t154 p1233). It is what
   its sampler already uses, so no `erf_inv` or Box-Muller on uniforms.
@@ -255,9 +289,12 @@ adapts. Each one has:
 - **Level T** passes on all four systems from the IMP model, with no
   system-specific code outside `system` extractors and `terms`.
 - **The engine runs Pol II, the NPC basket and mzIdentML.** On one L40:
-  - NPC basket: at least `npc_sampler2`'s speed;
-  - mzIdentML: at least 67 M;
-  - Pol II: within 2× of `few_bodies_beads`.
+  - NPC basket: at least `npc_sampler2`'s speed (met: see Progress);
+  - mzIdentML: at least 67 M (met);
+  - Pol II: within 2× of `few_bodies_beads`. Not met: 4.4× slower than
+    agy's 1.16 bn. Changed without asking: the engine stays generic, and
+    this speed is the template's job (R1-R3 remove what limits the
+    engine; see Progress).
 - **`few_bodies_beads`** reaches agy's speed and passes level D against the
   engine in float64, in both chain-count regimes.
 - **Every recipe** has its `check` call in one test script, which runs on a
@@ -270,9 +307,9 @@ adapts. Each one has:
 
 1. **`system` + `terms` + `check.terms`** for the four systems, reusing the
    three extractors and the existing term code. This is useful even if the
-   rest changes.
+   rest changes. Done 2026-11-03.
 2. **`engine` + `check.decisions` + the random-number contract.** Benchmark
-   against today's samplers on one L40.
+   against today's samplers on one L40. Done 2026-11-03.
 3. **`few_bodies_beads`:** port agy's sampler onto the core and fix the review
    items. Write recipes R1-R7 from it.
 4. **`many_movers` and `collective`;** recipes R8-R11.
@@ -359,3 +396,59 @@ steps) and float64 on the CPU. Both checks below pass on all four systems:
 - Split of work: agy_imp takes `few_bodies_beads` and recipes R1-R7 once the
   engine exists. It has fixed the six review items in its sampler
   (antigravity repo ff5cf6a); they were verified on GPU up to 65,536 chains.
+
+**Step 2 (2026-11-03): `engine`, `check.decisions`, `check.drift`,
+`bench`.**
+
+Level D: `python -m jax_mc.check decisions <system> [--chains N
+--ref-chains R --kT 1,10]` runs the incremental engine against the
+full-rescore engine with the same draws, in float64. A chain's draws don't
+depend on the number of chains, so the costly reference only runs the first
+R chains. No decision differs anywhere:
+
+| system | CPU, 8 chains, kT 1 and 0.3 | L40, 1,024 chains (256 checked), kT 1 and 10 | L40, 8,192 chains (128 checked) |
+|---|---|---|---|
+| mzIdentML | 0 of 640 each | 0 of 20,480 each | 0 of 6,144 |
+| Pol II | 0 of 1,960 each | 0 of 62,720 each | 0 of 18,816 |
+| NPC basket | 0 of 14,160 each | 0 of 453,120 each | 0 of 135,936 |
+
+The tracked energy matches a rescore to round-off: 1e-13 to 1e-11, and
+3e-7 on the NPC basket, whose energy at the REX2 start is 1.3e8. Level T
+was rerun after the changes and still holds on all four systems.
+
+Speed on one L40, float32 (`python -m jax_mc.bench`), in MC steps/s:
+
+| system | movers (groups) | engine | today's sampler |
+|---|---|---|---|
+| mzIdentML | 16 (4) | 259 M at 16,384 chains; 772 M at 65,536; 1.03 bn at 262,144 | IMP JAX path, 67-70 M |
+| NPC basket | 354 (9) | 14.6 M at 4,096; 19.5 M at 16,384; 20.5 M at 32,768 | `npc_sampler2`, 11.5 M |
+| Pol II | 49 (2) | 40 M at 4,096; 227 M at 32,768; 264 M at 65,536 | public SoA 665 M; agy 1.16 bn |
+
+**Things learned:**
+- **bayesianem EM can't keep running sums in float32.** Densities with no
+  model nearby have sums near 0, next to single overlaps of order 10. The
+  energy depends on log(sum + 1e-10), so the residue of adding and later
+  subtracting an overlap moved it by kT. The term now keeps per-block sums
+  (16 Gaussians a block) and recomputes the blocks a move touches. NPC
+  basket, 50 sweeps: drift 3.1 down to 7e-4 in float32, and 6e-6 down to
+  1e-12 in float64.
+- **Large totals drift in float32,** for example the NPC basket's pairs
+  term at 1.2e8 (about 200 after 50 sweeps). Decisions use per-move
+  differences, so they don't see it. Drivers resync at each frame.
+- **Static particles read once** (EV, isd density): Pol II +25% at 16,384
+  chains.
+- **What limits the engine:**
+  - With few chains, it's kernel launches. A step is 19-57 kernels
+    (Pol II: 26 for a bead, 51 for a body, before two small cuts), about
+    100 µs whatever the chain count.
+  - With many chains, it's memory traffic: a step reads every moving EV
+    particle of every chain.
+  - R1 (static grid), R2 (unrolling) and R3 (blocked beads) remove exactly
+    these, which is why the Pol II gap is the template's job.
+- **XLA autotuning is off** (`jax_mc.xla_defaults()`). On GPU it took most
+  of the compile time and grew with the number of chains (NPC basket,
+  4,096 chains: 56 s against 8.5 s), with no effect on speed.
+- **Command buffers for the loop and its conditionals:** +4% on Pol II.
+  Not used.
+- **agy_imp's check passes:** no copy of `X` in the compiled sweep loop.
+  The only copy is at entry, when the input isn't donated.

@@ -1,6 +1,8 @@
 """Exactness checks.
 
   python -m jax_mc.check terms polii [--states 6] [--cov frozen|rotate]
+  python -m jax_mc.check decisions polii [--chains 16 --sweeps 5 --kT 1,10]
+  python -m jax_mc.check drift polii [--chains 256 --sweeps 100]
 
 terms: at random states near the initial one, compare
   * positions: every row's coordinates from the degrees of freedom against
@@ -83,21 +85,108 @@ def terms(s, n_states=6, seed=0, scale=3.0, out=print, cpp_float=True):
     return dict(vals=vals, cpp=cpp, total=tot, cpp_total=cpp_total, dx=dx)
 
 
+def decisions(s, sweeps=5, chains=16, kTs=(1.0,), seed=0, ref_chains=None,
+              out=print):
+    """Level D: the incremental engine against the full-rescore engine
+       (same draws). Reports differing decisions, the acceptance rate per
+       mover kind, the tracked energy against a rescore, and positions.
+       A chain's draws don't depend on the number of chains, so the
+       reference can run on the first ref_chains chains only."""
+    import jax
+    from .engine import Engine
+    a, b = Engine(s), Engine(s, incremental=False)
+    ra = jax.jit(a.run, static_argnums=(1, 2))
+    rb = jax.jit(b.run, static_argnums=(1, 2))
+    kinds = np.array([mv.kind for mv in s.movers])
+    R = chains if ref_chains is None else min(ref_chains, chains)
+    out(f'{s.name}: {len(s.movers)} movers in {len(a.groups)} groups '
+        f'({", ".join(f"{G.kind} x{len(G.movers)}" for G in a.groups)}); '
+        f'{chains} chains ({R} in the reference), {sweeps} sweeps, '
+        f'{a.dtype().__name__}, {jax.devices()[0].device_kind}')
+    res = []
+    for kT in kTs:
+        sa, sb = a.init(chains, seed, kT), b.init(R, seed, kT)
+        t0 = time.time()
+        sa, da = ra(sa, sweeps, True)
+        da = np.asarray(da)
+        t1 = time.time()
+        sb, db = rb(sb, sweeps, True)
+        db = np.asarray(db)
+        t2 = time.time()
+        diff = da[..., :R] != db
+        hit = diff.any(axis=(0, 1))
+        acc = ', '.join(f'{k} {da[:, kinds == k].mean():.2f}'
+                        for k in dict.fromkeys(kinds))
+        Ea = np.asarray(a.total(sa))
+        Er = np.asarray(a.total(jax.jit(a.resync)(sa)))
+        Ea, Eb = Ea[:R], np.asarray(b.total(sb))
+        ok = ~hit
+        dX = (np.abs(np.asarray(sa['X'])[..., :R]
+                     - np.asarray(sb['X']))[..., ok].max()
+              if ok.any() else np.nan)
+        dE = np.abs(Ea - Eb)[ok].max() if ok.any() else np.nan
+        out(f'  kT {kT:g}: {int(diff.sum())} of {diff.size} decisions differ'
+            f' ({int(hit.sum())} chains); acceptance {acc}')
+        if diff.any():
+            sw, mo, ch = np.argwhere(diff)[0]
+            out(f'    first: sweep {sw}, mover {mo} ({kinds[mo]}), chain {ch}')
+        Er = Er[:R]
+        out(f'    tracked - rescored energy: max {np.abs(Ea - Er).max():.2e}'
+            f'; vs full-rescore engine: energy {dE:.2e}, positions {dX:.2e}'
+            f'; time {t1 - t0:.1f} s / {t2 - t1:.1f} s (incl. compile)')
+        res.append(dict(kT=kT, ndiff=int(diff.sum()), n=diff.size,
+                        dE_track=float(np.abs(Ea - Er).max()), dX=dX))
+    return res
+
+
+def drift(s, sweeps=100, chains=256, seed=0, kT=None, out=print):
+    """Level F: tracked energy against a rescore after `sweeps` sweeps (run
+       in float32 with x64 off)"""
+    import jax
+    from .engine import Engine
+    a = Engine(s)
+    st = a.init(chains, seed, kT)
+    st = jax.jit(a.run, static_argnums=(1, 2))(st, sweeps)
+    Ea = np.asarray(a.total(st), np.float64)
+    st2 = jax.jit(a.resync)(st)
+    Er = np.asarray(a.total(st2), np.float64)
+    per = np.abs(np.asarray(st['E']) - np.asarray(st2['E'])).max(axis=1)
+    out(f'{s.name}: {chains} chains, {sweeps} sweeps, '
+        f'{a.dtype().__name__}: |tracked - rescored| max '
+        f'{np.abs(Ea - Er).max():.3e} (energy ~{np.abs(Er).mean():.4g}); '
+        'per term ' + ', '.join(f'{t.label} {e:.1e}'
+                                for t, e in zip(a.terms, per)))
+    return np.abs(Ea - Er).max()
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('what', choices=['terms'])
+    ap.add_argument('what', choices=['terms', 'decisions', 'drift'])
     ap.add_argument('system')
     ap.add_argument('--states', type=int, default=6)
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--scale', type=float, default=3.0)
     ap.add_argument('--cov', default='frozen')
+    ap.add_argument('--chains', type=int, default=16)
+    ap.add_argument('--ref-chains', type=int, default=None)
+    ap.add_argument('--sweeps', type=int, default=5)
+    ap.add_argument('--kT', default='1')
+    ap.add_argument('--float32', action='store_true')
     a = ap.parse_args()
+    from . import xla_defaults
+    xla_defaults()
     import jax
-    jax.config.update('jax_enable_x64', True)
+    jax.config.update('jax_enable_x64', not a.float32)
     from . import sources, system
     src = sources.load(a.system)
     s = system.extract(src, cov_mode=a.cov)
-    terms(s, a.states, a.seed, a.scale)
+    if a.what == 'terms':
+        terms(s, a.states, a.seed, a.scale)
+    elif a.what == 'decisions':
+        decisions(s, a.sweeps, a.chains,
+                  [float(x) for x in a.kT.split(',')], a.seed, a.ref_chains)
+    else:
+        drift(s, a.sweeps, a.chains, a.seed)
 
 
 if __name__ == '__main__':

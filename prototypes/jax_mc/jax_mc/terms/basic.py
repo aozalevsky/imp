@@ -3,7 +3,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-from . import Term, geom
+from . import Term, geom, pad, slots
 from ..system import Unsupported
 
 HUB, HARMONIC, HLB, LINEAR = 0, 1, 2, 3
@@ -62,19 +62,50 @@ class Pairs(Term):
         self.off = a[:, 2] * (rad[self.ri] + rad[self.rj]) + a[:, 3]
         self.k, self.w = a[:, 4], a[:, 5]
         self.mode = a[:, 6].astype(np.int64)
+        self.rows_read = np.unique(np.concatenate([self.ri, self.rj]))
+        self.nuis_read = np.zeros(0, np.int64)
 
-    def energies(self, xi, xj):
-        """(n, C) energy per pair from positions (3, n, C)"""
-        t = geom.norm(xi - xj) - self.off[:, None]
-        mode = self.mode[:, None]
+    def energies(self, q, xi, xj):
+        """(len(q), C) energy of pairs q from positions (3, len(q), C)"""
+        g = lambda a: jnp.asarray(a)[q]                         # noqa
+        t = geom.norm(xi - xj) - g(self.off)[:, None]
+        mode = g(self.mode)[:, None]
         tc = jnp.where(mode == HUB, jnp.maximum(t, 0.),
                        jnp.where(mode == HLB, jnp.minimum(t, 0.), t))
         e = jnp.where(mode == LINEAR, t, 0.5 * tc * tc)
-        return (self.w * self.k)[:, None] * e
+        return g(self.w * self.k)[:, None] * e
 
     def full(self, st):
         X = st['X']
-        return jnp.sum(self.energies(X[:, self.ri], X[:, self.rj]), axis=0)
+        q = np.arange(len(self.ri))
+        return jnp.sum(self.energies(q, X[:, self.ri], X[:, self.rj]),
+                       axis=0)
+
+    def move_tables(self, s, moves):
+        """pairs with exactly one end moved (the mover is rigid on its
+           rows, so pairs inside it don't change), and the slots of their
+           moved ends (-1: not moved)"""
+        items, si, sj = [], [], []
+        for rows, _ in moves:
+            slot = slots(rows)
+            a = np.isin(self.ri, rows)
+            b = np.isin(self.rj, rows)
+            q = np.nonzero(a ^ b)[0]
+            items.append(q)
+            si.append([slot.get(int(self.ri[x]), -1) for x in q])
+            sj.append([slot.get(int(self.rj[x]), -1) for x in q])
+        return dict(item=pad(items, len(self.ri)), si=pad(si, -1),
+                    sj=pad(sj, -1))
+
+    def delta(self, tab, st, cache, mv):
+        n = len(self.ri)
+        q = tab['item']
+        qq = jnp.minimum(q, n - 1)
+        ri, rj = jnp.asarray(self.ri)[qq], jnp.asarray(self.rj)[qq]
+        X = st['X']
+        e = self.energies(qq, mv.pos(ri, tab['si']), mv.pos(rj, tab['sj'])) \
+            - self.energies(qq, X[:, ri], X[:, rj])
+        return jnp.sum(jnp.where((q < n)[:, None], e, 0.), axis=0), cache
 
 
 class SoftSphereEV(Term):
@@ -150,8 +181,11 @@ class SoftSphereEV(Term):
         self.rows, self.lab = rows[order], self.lab[order]
         self.r = s.row_radius[self.rows]
         kind = s.row_kind[self.rows]
-        self.n_static = int(np.sum(kind == 0))      # for the static recipes
+        self.n_static = int(np.sum(kind == 0))
+        self.xs0 = s.row_xyz0[self.rows[:self.n_static]].T  # (3, n_static)
         self.row_kind, self.row_ref = kind, s.row_ref[self.rows]
+        self.rows_read = self.rows
+        self.nuis_read = np.zeros(0, np.int64)
 
     def full(self, st):
         X = st['X'][:, self.rows]                   # (3, n, C)
@@ -187,6 +221,53 @@ class SoftSphereEV(Term):
         acc = jax.lax.fori_loop(0, nb_, lambda b, a: a + block(b),
                                 jnp.zeros(C, X.dtype))
         return 0.5 * self.kk * acc
+
+    def move_tables(self, s, moves):
+        """the mover's rows that are EV particles (EV index, slot), and which
+           pairs (moved particle, other particle) count: different labels,
+           the other one not moved (keep_s: static others, keep_m: the
+           rest)"""
+        n, ns = len(self.rows), self.n_static
+        pos = {int(r): i for i, r in enumerate(self.rows)}
+        idx, sl = [], []
+        for rows, _ in moves:
+            q = [(pos[int(r)], k) for k, r in enumerate(rows) if int(r) in pos]
+            idx.append([a for a, _ in q])
+            sl.append([k for _, k in q])
+        idx = pad(idx, n)
+        keep = np.zeros(idx.shape + (n,), bool)
+        for i, a in enumerate(idx):
+            ok = a < n
+            moved = np.zeros(n, bool)
+            moved[a[ok]] = True
+            la = self.lab[np.minimum(a, n - 1)]
+            keep[i] = ok[:, None] & ~moved[None] & (la[:, None] !=
+                                                    self.lab[None])
+        return dict(idx=idx, slot=pad(sl, 0), keep_s=keep[..., :ns],
+                    keep_m=keep[..., ns:])
+
+    def delta(self, tab, st, cache, mv):
+        """moved particles against all unmoved ones (pairs among moved
+           particles don't change: the mover is rigid on its rows). Static
+           particles are read from one copy shared by all chains."""
+        n, ns = len(self.rows), self.n_static
+        ri = jnp.asarray(self.r)[jnp.minimum(tab['idx'], n - 1)]
+        parts = [(jnp.asarray(self.xs0)[..., None], self.r[:ns],
+                  tab['keep_s']),
+                 (st['X'][:, self.rows[ns:]], self.r[ns:], tab['keep_m'])]
+
+        def e(xi):                                          # (3, A, C)
+            out = 0.
+            for xa, ra, keep in parts:
+                if xa.shape[1] == 0:
+                    continue
+                d = geom.norm(xi[:, :, None] - xa[:, None])
+                x = jnp.minimum(d - (ri[:, None] + ra[None])[..., None], 0.)
+                out = out + jnp.sum(jnp.where(keep[..., None], x * x, 0.),
+                                    axis=(0, 1))
+            return out
+        sl = tab['slot']
+        return 0.5 * self.kk * (e(mv.Xn[:, sl]) - e(mv.Xo[:, sl])), cache
 
 
 class CrossLinks(Term):
@@ -253,14 +334,71 @@ class CrossLinks(Term):
         for i, lst in enumerate(self.rcon):
             tab[i, :len(lst)] = lst
         self.con = tab                      # (nres, cmax), nc = padding
+        self.rows_read = np.unique(np.concatenate([self.ca, self.cb]))
+        self.nuis_read = np.unique(np.concatenate([self.s0, self.s1,
+                                                   self.psi]))
+
+    def energies(self, res, xa, xb, nu):
+        """(len(res), C) -log(w_r p_r) of restraints res, from the
+           positions (3, len(res), cmax, C) of their contributions' ends"""
+        nc = len(self.cp)
+        cidx = jnp.asarray(self.con)[res]                   # (R, cmax)
+        c = jnp.minimum(cidx, nc - 1)
+        g = lambda a: jnp.asarray(a)[c]                     # noqa
+        d = jnp.where(g(self.same)[..., None], 36.0 / 35.0
+                      * g(self.r0)[..., None], geom.norm(xa - xb))
+        term = geom.xl_term(d, nu[g(self.s0)], nu[g(self.s1)],
+                            nu[g(self.psi)], self.length, self.slope,
+                            self.CPP_FLOAT)                 # (R, cmax, C)
+        onem = jnp.where((cidx >= nc)[..., None], 1.0, 1.0 - term)
+        prob = 1.0 - jnp.prod(onem, axis=1)                 # (R, C)
+        return -jnp.log(prob * jnp.asarray(self.rw)[res][:, None])
+
+    def _ends(self, res):
+        c = np.minimum(self.con[res], len(self.cp) - 1)
+        return self.ca[c], self.cb[c]
 
     def full(self, st):
+        X = st['X']
+        res = np.arange(len(self.rcon))
+        a, b = self._ends(res)
+        return self.w * jnp.sum(self.energies(res, X[:, a], X[:, b],
+                                              st['nuis']), axis=0)
+
+    def move_tables(self, s, moves):
+        """restraints with a contribution that has exactly one end moved,
+           and for those contributions the slots of the ends (-1: use the
+           old position; contributions inside the mover don't change)"""
+        nres, cmax = self.con.shape
+        res, sa, sb = [], [], []
+        for rows, _ in moves:
+            slot = slots(rows)
+            a = np.isin(self.ca, rows)
+            b = np.isin(self.cb, rows)
+            cross = np.concatenate([a ^ b, [False]])        # nc = padding
+            q = np.nonzero(cross[self.con].any(axis=1))[0]
+            res.append(q)
+            sa.append([[slot.get(int(self.ca[c]), -1) if cross[c] else -1
+                        for c in self.con[i]] for i in q])
+            sb.append([[slot.get(int(self.cb[c]), -1) if cross[c] else -1
+                        for c in self.con[i]] for i in q])
+        A = max([len(q) for q in res] + [1])
+        tsa = np.full((len(moves), A, cmax), -1, np.int64)
+        tsb = np.full((len(moves), A, cmax), -1, np.int64)
+        for i in range(len(moves)):
+            if len(res[i]):
+                tsa[i, :len(res[i])] = sa[i]
+                tsb[i, :len(res[i])] = sb[i]
+        return dict(res=pad(res, nres, A), sa=tsa, sb=tsb)
+
+    def delta(self, tab, st, cache, mv):
+        nres = len(self.rcon)
+        q = tab['res']
+        rr = jnp.minimum(q, nres - 1)
+        c = jnp.minimum(jnp.asarray(self.con)[rr], len(self.cp) - 1)
+        a, b = jnp.asarray(self.ca)[c], jnp.asarray(self.cb)[c]
         X, nu = st['X'], st['nuis']
-        d = jnp.where(self.same[:, None], 36.0 / 35.0 * self.r0[:, None],
-                      geom.norm(X[:, self.ca] - X[:, self.cb]))
-        term = geom.xl_term(d, nu[self.s0], nu[self.s1], nu[self.psi],
-                            self.length, self.slope,
-                            self.CPP_FLOAT)                 # (nc, C)
-        onem = jnp.concatenate([1.0 - term, jnp.ones_like(term[:1])])
-        prob = 1.0 - jnp.prod(onem[self.con], axis=1)      # (nres, C)
-        return self.w * jnp.sum(-jnp.log(prob * self.rw[:, None]), axis=0)
+        e = self.energies(rr, mv.pos(a, tab['sa']), mv.pos(b, tab['sb']), nu) \
+            - self.energies(rr, X[:, a], X[:, b], nu)
+        return self.w * jnp.sum(jnp.where((q < nres)[:, None], e, 0.),
+                                axis=0), cache

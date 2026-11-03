@@ -4,12 +4,12 @@ Math as pm_jax.py (validated against C++ there)."""
 import numpy as np
 import jax.numpy as jnp
 
-from . import Term, geom
+from . import RowTerm, geom
 from .. import imp_hooks
 from ..system import Unsupported
 
 
-class BoundingBox(Term):
+class BoundingBox(RowTerm):
     """container.SingletonsRestraint over a BoundingBox3DSingletonScore with
        a HarmonicUpperBound"""
     name = 'bbox'
@@ -43,14 +43,13 @@ class BoundingBox(Term):
     def finalize(self, s):
         self.rows = s.rows(self.ps)
 
-    def full(self, st):
-        P = st['X'][:, self.rows]
+    def energies(self, q, P):
         cp = jnp.clip(P, self.lo[:, None, None], self.hi[:, None, None])
         t = jnp.maximum(geom.norm(P - cp) - self.mean, 0.)
-        return self.w * jnp.sum(0.5 * self.k * t * t, axis=0)
+        return self.w * (0.5 * self.k * t * t)
 
 
-class _Membrane(Term):
+class _Membrane(RowTerm):
     """container.PairsRestraint over AllBipartitePairContainer(membrane,
        particles) with an npc membrane score"""
     SCORE = None
@@ -91,8 +90,8 @@ class _Membrane(Term):
     def finalize(self, s):
         self.rows = s.rows(self.ps)
 
-    def _geom(self, st):
-        x, y, z = st['X'][:, self.rows]
+    def _geom(self, xyz):
+        x, y, z = xyz
         rxy = x * x + y * y
         r = jnp.maximum(jnp.sqrt(rxy), 1e-9)
         rscl = self.R / r
@@ -104,8 +103,8 @@ class MembraneBinding(_Membrane):
     name = 'membrane_binding'
     SCORE = 'SlabWithToroidalPoreMBMScore'
 
-    def full(self, st):
-        z, rxy, dist = self._geom(st)
+    def energies(self, q, xyz):
+        z, rxy, dist = self._geom(xyz)
         x0u, x0l, k = self.par
         h, rmin = self.h, self.rmin
         zu = jnp.where(z > 0., 0.5 * h + x0u, -0.5 * h - x0u)
@@ -118,27 +117,25 @@ class MembraneBinding(_Membrane):
         in_s = jnp.where(dist > du, 0.5 * k * (dist - du) ** 2,
                          jnp.where(dist < dl, 0.5 * k * (dist - dl) ** 2,
                                    0.))
-        e = jnp.where(rxy > self.R * self.R, out_s, in_s)
-        return self.w * jnp.sum(e, axis=0)
+        return self.w * jnp.where(rxy > self.R * self.R, out_s, in_s)
 
 
 class MembraneDepth(_Membrane):
     name = 'membrane_depth'
     SCORE = 'ToroidalPoreSurfaceDepthPairScore'
 
-    def full(self, st):
-        z, rxy, dist = self._geom(st)
+    def energies(self, q, xyz):
+        z, rxy, dist = self._geom(xyz)
         (k,) = self.par
         h, rmin = self.h, self.rmin
         inside_slab = (z <= 0.5 * h) & (z >= -0.5 * h)
         z0 = jnp.where(z >= 0., 0.5 * h, -0.5 * h)
         out_s = jnp.where(inside_slab, 0.5 * k * (z - z0) ** 2, 0.)
         in_s = jnp.where(dist < rmin, 0.5 * k * (dist - rmin) ** 2, 0.)
-        e = jnp.where(rxy > self.R * self.R, out_s, in_s)
-        return self.w * jnp.sum(e, axis=0)
+        return self.w * jnp.where(rxy > self.R * self.R, out_s, in_s)
 
 
-class OverallPosition(Term):
+class OverallPosition(RowTerm):
     """npc.OverallPositionRestraint (one particle each, consider_radius
        off): w / sigma * max(|x - x0| - tolerance, 0)^2"""
     name = 'overall_position'
@@ -167,11 +164,10 @@ class OverallPosition(Term):
         self.x0 = a[:, 1:4].T
         self.tol, self.wsig = a[:, 4], a[:, 5]
 
-    def full(self, st):
-        dx = st['X'][:, self.rows] - self.x0[:, :, None]
-        diff = geom.norm(dx) - self.tol[:, None]
-        return jnp.sum(self.wsig[:, None] * jnp.where(diff > 0, diff * diff,
-                                                      0.), axis=0)
+    def energies(self, q, x):
+        g = lambda a: jnp.asarray(a)[..., q]                # noqa
+        diff = geom.norm(x - g(self.x0)[:, :, None]) - g(self.tol)[:, None]
+        return g(self.wsig)[:, None] * jnp.where(diff > 0, diff * diff, 0.)
 
 
 TERMS = [BoundingBox, MembraneBinding, MembraneDepth, OverallPosition]
