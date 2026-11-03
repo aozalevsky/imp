@@ -146,8 +146,9 @@ def compare(a, b, sweeps=5, chains=16, kTs=(1.0,), seed=0, ref_chains=None,
             r['dE_track'] = float(np.abs(Ea - Er).max())
             msg.append(f'tracked - rescored energy: max {r["dE_track"]:.2e}')
         if ok.any():
-            Xa = s.positions(a.dofs(sa))[..., :R][..., ok]
-            Xb = s.positions(b.dofs(sb))[..., ok]
+            host = lambda d: {k: np.asarray(v) for k, v in d.items()}  # noqa
+            Xa = s.positions(host(a.dofs(sa)))[..., :R][..., ok]
+            Xb = s.positions(host(b.dofs(sb)))[..., ok]
             r['dX'] = float(np.abs(Xa - Xb).max())
             dE = np.abs(np.asarray(a.total(sa))[:R]
                         - np.asarray(b.total(sb)))[ok].max()

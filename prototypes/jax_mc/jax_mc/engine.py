@@ -403,10 +403,11 @@ class Engine:
         return jnp.sum(st['E'], axis=0) + self.s.constant
 
     def dofs(self, st):
-        """chain-last degrees of freedom (numpy), as System.initial_dofs"""
-        X = np.asarray(st['X'])
-        return dict(quat=np.asarray(st['quat']), trans=X[:, self.center_row],
-                    bead=X[:, self.bead_row], nuis=np.asarray(st['nuis']))
+        """chain-last degrees of freedom, as System.initial_dofs (device
+           arrays; jittable)"""
+        X = st['X']
+        return dict(quat=st['quat'], trans=X[:, self.center_row],
+                    bead=X[:, self.bead_row], nuis=st['nuis'])
 
 
 def make(s, incremental=True):
@@ -530,5 +531,4 @@ class CollectiveEngine:
         return jnp.sum(st['E'], axis=0) + self.s.constant
 
     def dofs(self, st):
-        return {k: np.asarray(st[k]) for k in ('quat', 'trans', 'bead',
-                                               'nuis')}
+        return {k: st[k] for k in ('quat', 'trans', 'bead', 'nuis')}

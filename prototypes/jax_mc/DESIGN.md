@@ -223,14 +223,35 @@ Every template must use the same draws as the engine. That is what makes
 
 ### `jax_mc.run`: drivers
 
-These are taken from `run_soa.py`, `run_mpi.py`, `fast_dofs.py` and
-`dofs_to_rmf.py`:
-- frames of N sweeps in device-side blocks;
-- REX ladders;
-- the rescore policy (every frame, or recorded frames only);
-- DOF snapshots written from a thread, with RMF made afterwards;
-- one process per GPU;
-- `--cpi/--cpt/--maxh` checkpointing (from the NPC work).
+`python -m jax_mc.run <system> --out DIR ...` runs any sampler that follows
+the protocol (`--sampler module:factory`; default: the reference engine).
+It takes its ideas from `run_soa.py`, `run_mpi.py` and the NPC basket's
+checkpointing:
+- **Frames** of N sweeps, in blocks of frames inside one jitted call. The
+  next block is dispatched before the previous block's records are
+  written.
+- **Temperatures:**
+  - fixed (`--kT`);
+  - PMI's simulated annealing (`--anneal tmin,tmax,nmin,nmax`);
+  - replica exchange (`--ladder`, or `--ladder` alone for the protocol's
+    ladder). The chains form C / len(ladder) independent ladders of
+    consecutive chains. Neighbouring rungs try to swap after each frame,
+    even and odd pairs on alternate frames.
+- **Rescore policy** (R10): every K-th frame the energies are rescored from
+  scratch (`resync`), and the largest |tracked - rescored| is recorded.
+- **Outputs are append-only,** so runs can be open-ended:
+  - `records.f64`: frame, drift, and every chain's energy and kT;
+  - `dofs.f32`: every `--thin` frames, every chain's degrees of freedom;
+  - read them with `run.records(out)` and `run.snapshots(out)`.
+- **Checkpoints,** GROMACS-style:
+  - `--cpt` minutes, written by a thread from a device copy;
+  - `--cpi` continues, cutting the outputs back to the checkpoint;
+  - `--maxh`, a STOP file, SIGINT or SIGTERM stop the run cleanly.
+  - Every program goes into a persistent compile cache, so a restarted
+    session runs the same executables.
+  - The Python hash seed is pinned to 0, because PMI builds systems in set
+    order.
+- **Not yet:** RMF from the snapshots, and one process per GPU.
 
 ### `jax_mc.check`: the exactness harness
 
@@ -310,7 +331,8 @@ class MySampler:
     def init(self, C, seed=0, kT=None): ...   # state: any pytree
     def run(self, st, n_sweeps, record=False): ...
         # record=True: (state, decisions (n_sweeps, n_movers, C) bool)
-    def dofs(self, st): ...         # the System's degrees of freedom (numpy)
+    def dofs(self, st): ...         # the System's degrees of freedom
+                                    # (device arrays, jittable)
     def total(self, st): ...        # (C,) tracked total energy
     def resync(self, st): ...       # optional: energies from scratch
 ```
@@ -369,8 +391,8 @@ that have already been taken and checked.
    against today's samplers on one L40. Done 2026-11-03.
 3. **`few_bodies_beads`:** port agy's sampler onto the core and fix the review
    items. Write recipes R1-R7 from it.
-4. **`many_movers` and `collective`;** recipes R8-R11. `collective` done
-   2026-11-03; next `jax_mc.run`.
+4. **`many_movers` and `collective`;** recipes R8-R11. `collective` and
+   `jax_mc.run` done 2026-11-03; next RMF output, then `many_movers`.
 5. **The guide;** clean up the old prototype directories, which keep working
    until the templates replace them.
 
@@ -547,3 +569,37 @@ Speed on one L40, float32 (`python -m jax_mc.bench`), in MC steps/s:
   | template, timed from the start | 0.06 M | 6% acceptance instead of 0.1%, so lists are rebuilt all the time |
 
   `bench` gained `--burn`, `--ladder` and `--kT a,b,...` for this.
+
+**Step 4, part 2 (2026-11-03): `jax_mc.run`.**
+
+- **Replica exchange:** each ladder stays a permutation of its rungs at
+  every frame (mzIdentML, 32 chains, 4 rungs, 444 swaps).
+- **Snapshots:** energies recomputed from saved snapshots match C++ at the
+  stored degrees of freedom. The relative difference is 1e-8 on
+  mzIdentML. On Pol II it is 2e-3, the known EM pair-list slack: about
+  2 kT, as in the term check.
+- **Restarts:**
+  - mzIdentML, CPU, float64: a run stopped at frame 20 and continued with
+    `--cpi` gives byte-identical records and snapshots to a straight
+    40-frame run.
+  - Pol II, CPU and GPU: snapshots are byte-identical between separate
+    runs and across a restart (GPU: 4,096 chains, 24 frames). The recorded
+    energies can differ in the last bit: one float32 unit in the last
+    place, in 224 of 98,304 values on the GPU.
+  - Two identical processes differ like this too, even with the same
+    compiled executables. `--xla_gpu_deterministic_ops` doesn't change it.
+    Rescores also refresh the EM caches, so a later decision could in
+    principle flip after one. That is at the 1e-7 level.
+- **Mature NPC through the driver** (collective template, 512 chains on
+  the protocol's ladder, 30 frames of 1,000 steps): 5,084 swaps, and the
+  energy at the lowest rung went from 18,474 to 6,181.
+
+**Things learned:**
+- **PMI builds depend on Python's hash seed.** The order of cross-link
+  restraints and contributions, the orientation of pairs, and the last
+  bits of some setup values (mature NPC EM covariances) all change from
+  one process to the next.
+  - `CrossLinks` now orders its restraints and contributions canonically.
+  - `jax_mc.run` pins `PYTHONHASHSEED=0`.
+- **JAX only caches compiles slower than 1 s by default.** The driver
+  caches every program.

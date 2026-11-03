@@ -298,17 +298,32 @@ class CrossLinks(Term):
                     or (slope is not None and r.get_slope() != slope)
                     or r.get_log_prob()):
                 raise Unsupported('cross-link variant')
-        cp, cs, cpsi, rcon = [], [], [], []
+        # PMI orders the restraints, their ambiguous contributions and the
+        # two ends of each by set iteration, which depends on Python's hash
+        # seed. In a canonical order (lower particle first, contributions
+        # sorted, restraints sorted by them) the sums and products are the
+        # same in every process.
+        canon = []
         for r in rs:
-            lst = []
+            con = []
             for k in range(r.get_number_of_contributions()):
-                lst.append(len(cp))
-                cp.append([int(x) for x in
-                           r.get_contribution_particle_indexes(k)])
-                cs.append([int(x) for x in
-                           r.get_contribution_sigma_indexes(k)])
-                cpsi.append(int(r.get_contribution_psi_index(k)))
-            rcon.append(lst)
+                pa, pb = (int(x) for x in
+                          r.get_contribution_particle_indexes(k))
+                sa, sb = (int(x) for x in
+                          r.get_contribution_sigma_indexes(k))
+                if pa > pb:
+                    pa, pb, sa, sb = pb, pa, sb, sa
+                con.append(((pa, pb), (sa, sb),
+                            int(r.get_contribution_psi_index(k))))
+            canon.append((sorted(con), r.get_weight()))
+        canon.sort()
+        cp, cs, cpsi, rcon = [], [], [], []
+        for con, _ in canon:
+            rcon.append(list(range(len(cp), len(cp) + len(con))))
+            for p_, s_, psi in con:
+                cp.append(list(p_))
+                cs.append(list(s_))
+                cpsi.append(psi)
         for a, b in cp:
             s.row(a)
             s.row(b)
@@ -316,7 +331,7 @@ class CrossLinks(Term):
             s.nuisance(a)
         self.length, self.slope = length, slope
         self.w = w * d.get_weight()
-        self.rw = np.array([r.get_weight() for r in rs])
+        self.rw = np.array([w_ for _, w_ in canon])
         self.cp, self.cs, self.cpsi, self.rcon = cp, cs, cpsi, rcon
         self.restraints.append((w, d))
 

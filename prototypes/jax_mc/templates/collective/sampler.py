@@ -531,5 +531,4 @@ class CollectiveNL:
                     overflowed=int(np.sum(st['overflow'])))
 
     def dofs(self, st):
-        return {k: np.asarray(st[k]) for k in ('quat', 'trans', 'bead',
-                                               'nuis')}
+        return {k: st[k] for k in ('quat', 'trans', 'bead', 'nuis')}

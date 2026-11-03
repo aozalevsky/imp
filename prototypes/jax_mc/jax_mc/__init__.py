@@ -11,3 +11,19 @@ def xla_defaults():
     f = os.environ.get('XLA_FLAGS', '')
     if 'xla_gpu_autotune_level' not in f:
         os.environ['XLA_FLAGS'] = (f + ' --xla_gpu_autotune_level=0').strip()
+
+
+def pin_hash_seed():
+    """Re-run this process with PYTHONHASHSEED=0 unless it is set. PMI
+       builds systems by iterating over sets (cross-link contributions,
+       connectivity pairs, rigid-body setup), so with Python's default
+       random hash seed two builds differ in order and in the last bits of
+       some setup values, and a restarted run would not continue the
+       checkpointed one exactly."""
+    import os
+    import sys
+    if 'PYTHONHASHSEED' not in os.environ:
+        os.environ['PYTHONHASHSEED'] = '0'
+        spec = getattr(sys.modules.get('__main__'), '__spec__', None)
+        args = ['-m', spec.name] + sys.argv[1:] if spec else sys.argv
+        os.execv(sys.executable, [sys.executable] + args)
