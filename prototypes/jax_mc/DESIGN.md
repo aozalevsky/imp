@@ -181,6 +181,11 @@ The first set covers the four systems:
   draws, and is the reference for `check.decisions`.
 - **Static particles** are read from one copy shared by all chains in the
   EV and isd EM deltas. Pol II: 369 of 453 EV particles are static.
+- **`CollectiveEngine`** is the reference when every mover moves at every
+  MC step: IMP's MonteCarlo with several movers, as in the mature NPC. All
+  movers propose, every term is rescored, and one Metropolis decision
+  keeps or rejects the whole step. `engine.make(s)` picks the right
+  engine.
 - **Not in the engine:**
   - no thresholds tuned to a GPU or a system;
   - no unrolling;
@@ -202,6 +207,8 @@ The first set covers the four systems:
     by their number of members).
   - Nuisance: `clip(x + sigma * Z[i, 0], lower, upper)`.
   - Metropolis: accept if `U[i, 2] < exp(-dE / kT)`.
+  - Collective step s (every mover moves): the draws of sweep s, mover i
+    proposes from row i, and the decision is `U[0, 2] < exp(-dE / kT)`.
 
   This is the shape agy_imp proposed (forum #imp t154 p1233). It is what
   its sampler already uses, so no `erf_inv` or Box-Muller on uniforms.
@@ -282,7 +289,7 @@ adapts. Each one has:
 |---|---|---|---|---|
 | `few_bodies_beads` | few rigid bodies, many beads, fixed mover order (Pol II) | agy's `sampler_soa.py`, moved onto `system`, `terms` and the random-number contract, with the review fixes | R1-R7, R10, R11 | agy's 1.16 bn, now with D against the engine |
 | `many_movers` | hundreds of movers, generic PMI terms (NPC basket, mzIdentML) | the engine plus R1, R5 and R9 | R1, R5, R9-R11 | NPC basket > 11.5 M; mzIdentML > 67 M (incremental instead of full rescore) |
-| `collective` | every step moves every body (mature NPC) | `pm_sampler2.py`, moved onto `system`, `terms` and `run`, with its own step | R8, R10, R11 | ≥ 1.2 M; then batch or fuse the rebuilds |
+| `collective` | every step moves every body (mature NPC) | `pm_sampler2.py`, moved onto `system`, `terms` and `run`, with its own step | R8, R10, R11 | ≥ 1.2 M; then batch or fuse the rebuilds. Done: `templates/collective/`, 1.06 M, the same as `pm_sampler2` measured the same way |
 
 ## From the engine to a specialized sampler
 
@@ -362,7 +369,8 @@ that have already been taken and checked.
    against today's samplers on one L40. Done 2026-11-03.
 3. **`few_bodies_beads`:** port agy's sampler onto the core and fix the review
    items. Write recipes R1-R7 from it.
-4. **`many_movers` and `collective`;** recipes R8-R11.
+4. **`many_movers` and `collective`;** recipes R8-R11. `collective` done
+   2026-11-03; next `jax_mc.run`.
 5. **The guide;** clean up the old prototype directories, which keep working
    until the templates replace them.
 
@@ -502,3 +510,40 @@ Speed on one L40, float32 (`python -m jax_mc.bench`), in MC steps/s:
   Not used.
 - **agy_imp's check passes:** no copy of `X` in the compiled sweep loop.
   The only copy is at entry, when the input isn't donated.
+
+**Step 4, part 1 (2026-11-03): `CollectiveEngine` and
+`templates/collective/`.**
+
+- **Collective engine:** the reference for systems whose movers all move
+  at every step.
+  - Its energies agree with C++ to within the known EM pair-list slack.
+    The term check gives 0.26 without C++'s pair lists, and the same 0.22
+    already shows at the initial state.
+- **Collective template:** `pm_sampler2`, ported onto the System and the
+  terms. It reuses the reference's proposals and the membrane and
+  bounding-box terms' own energy functions. Its fast parts (neighbour
+  lists, closed-form overall position, EM pair tables, membrane
+  candidates) each assert their precondition.
+- **Level D, float64, against the collective engine:**
+
+  | where | chains (reference) | steps | kT | decisions | rebuilds per chain |
+  |---|---|---|---|---|---|
+  | CPU | 8 (4) | 10 | 30, 300 | 0 of 40 differ, each | |
+  | L40 | 256 (16) | 200 | 300 | 0 of 3,200 differ | 48 inner, 4 outer |
+  | L40 | 256 (16) | 200 | 3000 | 0 of 3,200 differ | 155 inner, 15 outer |
+
+  - Energies agree to 1e-11 (1e-10 at kT 3000), and positions exactly.
+  - At kT 3000, 4 of 256 chains outgrew their lists, which are sized from
+    the initial state. Such chains get a NaN energy by design, so it shows.
+    That temperature takes the assembly apart; the protocol's ladder ends
+    far lower.
+- **Speed,** one L40, float32, 512 chains on the protocol's ladder, timed
+  after 20,000 burn-in steps:
+
+  | sampler | MC steps/s | notes |
+  |---|---|---|
+  | template | 1.06 M | |
+  | `pm_sampler2` (`pm_exp.py`) | 1.04 M | same node, same protocol |
+  | template, timed from the start | 0.06 M | 6% acceptance instead of 0.1%, so lists are rebuilt all the time |
+
+  `bench` gained `--burn`, `--ladder` and `--kT a,b,...` for this.

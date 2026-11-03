@@ -95,6 +95,24 @@ def _rotate(R, v):
             + R[:, 2][:, None] * v[2][None])
 
 
+def chain_keys(seed, C):
+    """per-chain keys: chain c's numbers don't depend on C"""
+    return jax.vmap(lambda c: jax.random.fold_in(jax.random.key(seed), c))(
+        jnp.arange(C))
+
+
+def draws(key, sweep, n_movers, dtype):
+    """the random-number contract: U (n_movers, 3, C), Z (n_movers, 6, C)
+       for sweep (or collective step) `sweep`, from per-chain keys (C,)"""
+    def one(k):
+        k = jax.random.fold_in(k, sweep)
+        return (jax.random.uniform(k, (n_movers, 3), dtype),
+                jax.random.normal(jax.random.fold_in(k, 1), (n_movers, 6),
+                                  dtype))
+    U, Z = jax.vmap(one)(key)
+    return jnp.moveaxis(U, 0, -1), jnp.moveaxis(Z, 0, -1)
+
+
 class Move:
     """A proposed coordinate move, as Term.delta sees it.
        rows (M,) padded with n_rows; Xo, Xn (3, M, C) old and new positions
@@ -131,6 +149,8 @@ class Group:
 
 
 class Engine:
+    """the reference sampler for SerialMover systems (see the module doc)"""
+
     def __init__(self, s, incremental=True):
         if s.mode != 'serial':
             raise Unsupported(f'mover mode "{s.mode}" (collective template)')
@@ -165,6 +185,7 @@ class Engine:
             for j, i in enumerate(G.movers):
                 self.gid[i], self.jid[i] = g, j
         self._branches = [self._branch(G) for G in self.groups]
+        self.steps_per_sweep = n
 
     # ---------------- host tables ---------------------------------------
     def _group(self, key, movers):
@@ -323,14 +344,7 @@ class Engine:
 
     def draws(self, key, sweep, dtype):
         """U (n_movers, 3, C), Z (n_movers, 6, C) for one sweep"""
-        n = len(self.s.movers)
-
-        def one(k):
-            k = jax.random.fold_in(k, sweep)
-            return (jax.random.uniform(k, (n, 3), dtype),
-                    jax.random.normal(jax.random.fold_in(k, 1), (n, 6), dtype))
-        U, Z = jax.vmap(one)(key)
-        return jnp.moveaxis(U, 0, -1), jnp.moveaxis(Z, 0, -1)
+        return draws(key, sweep, len(self.s.movers), dtype)
 
     def sweep(self, st):
         """one sweep; returns the state and the decisions (n_movers, C)"""
@@ -373,8 +387,7 @@ class Engine:
         d = {k: jnp.asarray(v, dt) for k, v in d.items()}
         st = dict(X=s.positions(d, jnp), quat=d['quat'], nuis=d['nuis'])
         E, cache = jax.jit(self.full)(st)
-        key = jax.vmap(lambda c: jax.random.fold_in(jax.random.key(seed), c))(
-            jnp.arange(C))
+        key = chain_keys(seed, C)
         kT = s.kT if kT is None else kT
         return dict(st, E=E, cache=cache,
                     kT=jnp.broadcast_to(jnp.asarray(kT, dt), (C,)), key=key,
@@ -394,3 +407,128 @@ class Engine:
         X = np.asarray(st['X'])
         return dict(quat=np.asarray(st['quat']), trans=X[:, self.center_row],
                     bead=X[:, self.bead_row], nuis=np.asarray(st['nuis']))
+
+
+def make(s, incremental=True):
+    """the reference sampler for a system: Engine for SerialMover systems,
+       CollectiveEngine when every mover moves every step"""
+    return Engine(s, incremental) if s.mode == 'serial' else \
+        CollectiveEngine(s)
+
+
+class CollectiveEngine:
+    """The reference sampler when every mover moves at every MC step (IMP's
+       MonteCarlo with several movers; the mature NPC): all movers propose,
+       the energy is rescored from scratch, and one Metropolis decision
+       keeps or rejects the whole step.
+
+       Random numbers: step s uses the draws of sweep s (engine.draws);
+       mover i proposes from row i as in a serial sweep, and the decision
+       is U[0, 2] < exp(-dE / kT). Decisions are recorded as
+       (n_steps, 1, C).
+
+       State: quat (4, nb, C), trans (3, nb, C), bead (3, nbead, C),
+       nuis (N, C), E (T, C), kT (C,), key (C,), sweep, n_acc (1, C)."""
+    incremental = False
+    steps_per_sweep = 1
+
+    def __init__(self, s):
+        self.s, self.terms = s, list(s.terms)
+        seen = set()
+        for mv in s.movers:
+            if mv.kind == 'transform':
+                raise Unsupported('TransformMover in a collective step')
+            own = {('b', b) for b in mv.bodies} | {('x', k) for k in mv.beads}
+            if mv.kind == 'normal':
+                own = {('n', mv.nuis)}
+            if own & seen:
+                raise Unsupported('collective step with overlapping movers')
+            seen |= own
+        mvs = s.movers
+        idx = lambda k: np.array([i for i, mv in enumerate(mvs)  # noqa
+                                  if mv.kind == k], np.int64)
+        self.i_rb, self.i_ball = idx('rb'), idx('ball')
+        self.i_nu = idx('normal')
+        self.rb_body = np.array([mvs[i].bodies[0] for i in self.i_rb],
+                                np.int64)
+        self.rb_trans = np.array([mvs[i].max_trans for i in self.i_rb])
+        self.rb_rot = np.array([mvs[i].max_rot for i in self.i_rb])
+        self.ball_bead = np.array([mvs[i].beads[0] for i in self.i_ball],
+                                  np.int64)
+        self.ball_r = np.array([mvs[i].radius for i in self.i_ball])
+        self.nu_idx = np.array(
+            [s.nuis_of[int(s._moved_nuis_order[mvs[i].nuis])]
+             for i in self.i_nu], np.int64)
+        self.nu_sigma = np.array([mvs[i].sigma for i in self.i_nu])
+
+    dtype = staticmethod(Engine.dtype)
+
+    def _core(self, d):
+        X = self.s.positions(d, jnp)
+        return dict(X=X, quat=d['quat'], nuis=d['nuis'])
+
+    def energies(self, d):
+        core = self._core(d)
+        return jnp.stack([t.full(core) for t in self.terms])
+
+    def init(self, C, seed=0, kT=None, dofs=None):
+        s, dt = self.s, self.dtype()
+        d = s.initial_dofs(C) if dofs is None else dofs
+        d = {k: jnp.asarray(v, dt) for k, v in d.items()}
+        kT = s.kT if kT is None else kT
+        return dict(d, E=jax.jit(self.energies)(d),
+                    kT=jnp.broadcast_to(jnp.asarray(kT, dt), (C,)),
+                    key=chain_keys(seed, C), sweep=jnp.zeros((), jnp.int32),
+                    n_acc=jnp.zeros((1, C), jnp.int32))
+
+    def propose(self, d, U, Z):
+        """new dofs with every mover's proposal"""
+        s = self.s
+        d = dict(d)
+        T = lambda a: jnp.moveaxis(a, 0, 1)                  # noqa
+        if len(self.i_rb):
+            u, z = T(U[self.i_rb]), T(Z[self.i_rb])         # (3|6, k, C)
+            b = self.rb_body
+            v = _ball(z, u, self.rb_trans[:, None])
+            qr = _axis_angle(z, u, self.rb_rot[:, None])
+            d['quat'] = d['quat'].at[:, b].set(
+                _normalize(_qmul(qr, d['quat'][:, b])))
+            d['trans'] = d['trans'].at[:, b].add(v)
+        if len(self.i_ball):
+            u, z = T(U[self.i_ball]), T(Z[self.i_ball])
+            d['bead'] = d['bead'].at[:, self.ball_bead].add(
+                _ball(z, u, self.ball_r[:, None]))
+        if len(self.i_nu):
+            z = Z[self.i_nu, 0]                              # (k, C)
+            k = self.nu_idx
+            d['nuis'] = d['nuis'].at[k].set(jnp.clip(
+                d['nuis'][k] + self.nu_sigma[:, None] * z,
+                s.nuis_lower[k][:, None], s.nuis_upper[k][:, None]))
+        return d
+
+    def sweep(self, st):
+        """one collective MC step; returns the state and the decision (1, C)"""
+        n = len(self.s.movers)
+        U, Z = draws(st['key'], st['sweep'], n, st['quat'].dtype)
+        d = {k: st[k] for k in ('quat', 'trans', 'bead', 'nuis')}
+        dn = self.propose(d, U, Z)
+        En = self.energies(dn)
+        dE = jnp.sum(En - st['E'], axis=0)
+        acc = U[0, 2] < jnp.exp(-dE / st['kT'])
+        new = {k: jnp.where(acc, dn[k], d[k]) for k in d}
+        return dict(st, **new, E=jnp.where(acc, En, st['E']),
+                    sweep=st['sweep'] + 1,
+                    n_acc=st['n_acc'] + acc[None]), acc[None]
+
+    run = Engine.run
+
+    def resync(self, st):
+        d = {k: st[k] for k in ('quat', 'trans', 'bead', 'nuis')}
+        return dict(st, E=self.energies(d))
+
+    def total(self, st):
+        return jnp.sum(st['E'], axis=0) + self.s.constant
+
+    def dofs(self, st):
+        return {k: np.asarray(st[k]) for k in ('quat', 'trans', 'bead',
+                                               'nuis')}

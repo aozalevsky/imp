@@ -126,13 +126,18 @@ def compare(a, b, sweeps=5, chains=16, kTs=(1.0,), seed=0, ref_chains=None,
         diff = da[..., :R] != db
         hit = diff.any(axis=(0, 1))
         ok = ~hit
-        acc = ', '.join(f'{k} {da[:, kinds == k].mean():.2f}'
-                        for k in dict.fromkeys(kinds))
+        if da.shape[1] == len(kinds):
+            acc = ', '.join(f'{k} {da[:, kinds == k].mean():.2f}'
+                            for k in dict.fromkeys(kinds))
+        else:                               # collective steps
+            acc = f'{da.mean():.3f}'
         out(f'  kT {kT:g}: {int(diff.sum())} of {diff.size} decisions differ'
             f' ({int(hit.sum())} chains); acceptance {acc}')
         if diff.any():
             sw, mo, ch = np.argwhere(diff)[0]
-            out(f'    first: sweep {sw}, mover {mo} ({kinds[mo]}), chain {ch}')
+            what = f'mover {mo} ({kinds[mo]})' if da.shape[1] == len(kinds) \
+                else 'collective step'
+            out(f'    first: sweep {sw}, {what}, chain {ch}')
         r = dict(kT=kT, ndiff=int(diff.sum()), n=diff.size)
         msg = []
         if hasattr(a, 'resync'):
@@ -148,6 +153,8 @@ def compare(a, b, sweeps=5, chains=16, kTs=(1.0,), seed=0, ref_chains=None,
                         - np.asarray(b.total(sb)))[ok].max()
             msg.append(f'vs reference: energy {dE:.2e}, positions '
                        f'{r["dX"]:.2e}')
+        if hasattr(a, 'stats'):
+            msg.append(', '.join(f'{k} {v}' for k, v in a.stats(sa).items()))
         msg.append(f'time {t1 - t0:.1f} s / {t2 - t1:.1f} s (incl. compile)')
         out('    ' + '; '.join(msg))
         res.append(r)
@@ -158,12 +165,17 @@ def decisions(s, sweeps=5, chains=16, kTs=(1.0,), seed=0, ref_chains=None,
               sampler=None, out=print):
     """Level D. Without `sampler`: the incremental engine against the
        full-rescore engine (same draws). With sampler (a factory
-       s -> sampler): that sampler against the engine."""
-    from .engine import Engine
+       s -> sampler): that sampler against the reference engine
+       (CollectiveEngine when every mover moves every step)."""
+    from .engine import Engine, make
     if sampler is None:
+        if s.mode != 'serial':
+            raise SystemExit('collective system: the reference engine is a '
+                             'full rescore already; check a sampler '
+                             'against it with --sampler')
         a, b = Engine(s), Engine(s, incremental=False)
     else:
-        a, b = sampler(s), Engine(s)
+        a, b = sampler(s), make(s)
     return compare(a, b, sweeps, chains, kTs, seed, ref_chains, out)
 
 
@@ -178,8 +190,8 @@ def drift(s, sweeps=100, chains=256, seed=0, kT=None, out=print):
     """Level F: tracked energy against a rescore after `sweeps` sweeps (run
        in float32 with x64 off)"""
     import jax
-    from .engine import Engine
-    a = Engine(s)
+    from .engine import make
+    a = make(s)
     st = a.init(chains, seed, kT)
     st = jax.jit(a.run, static_argnums=(1, 2))(st, sweeps)
     Ea = np.asarray(a.total(st), np.float64)

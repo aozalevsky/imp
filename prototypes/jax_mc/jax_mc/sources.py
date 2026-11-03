@@ -27,6 +27,7 @@ class Source:
     mode: str
     kT: float = 1.0
     extra: dict = field(default_factory=dict)
+    ladder: list = None         # the protocol's REX temperatures, if any
 
 
 def _dir(var):
@@ -72,7 +73,8 @@ def mature_npc(time='mature', temp_index=0, **kw):
     movers = [IMP.core.RigidBodyMover(S.m, rb, S.mc_max_trans, S.mc_max_rot)
               for rb in S.rigbods]
     return Source('mature_npc', S.m, list(S.rs), movers, 'all',
-                  kT=float(S.temps[temp_index]), extra=dict(S=S))
+                  kT=float(S.temps[temp_index]), extra=dict(S=S),
+                  ladder=[float(t) for t in S.temps])
 
 
 def mzid(seed=1):
