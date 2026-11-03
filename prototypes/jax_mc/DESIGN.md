@@ -1,10 +1,10 @@
 # jax_mc: a core plus recipes for fast, exact JAX Monte Carlo samplers
 
-Status, 2026-11-03: steps 1, 2 and 4 are done (`system`, `terms`,
-`engine`, `check`, `bench`, `run`, `rmf`, `templates/collective`), and step
-5's guide (GUIDE.md) and test script (`tests/check_all.sh`). Step 3
-(`templates/few_bodies_beads`, recipes R1-R7) is agy_imp's, in progress. See
-[Progress](#progress).
+Status, 2026-11-03: steps 1-4 are done (`system`, `terms`, `engine`,
+`check`, `bench`, `run`, `rmf`; `templates/collective`, and agy_imp's
+`templates/few_bodies_beads` with recipes R1-R7), and step 5's guide
+(GUIDE.md) and test script (`tests/check_all.sh`). Left: cleaning up the old
+prototype directories. See [Progress](#progress).
 
 ## Why
 
@@ -319,7 +319,7 @@ adapts. Each one has:
 
 | template | system shape | starts from | recipes | target on one L40 |
 |---|---|---|---|---|
-| `few_bodies_beads` | few rigid bodies, many beads, fixed mover order (Pol II) | agy's `sampler_soa.py`, moved onto `system`, `terms` and the random-number contract, with the review fixes | R1-R7, R10, R11 | agy's 1.16 bn, now with D against the engine |
+| `few_bodies_beads` | few rigid bodies, many beads, fixed mover order (Pol II) | agy's `sampler_soa.py`, moved onto `system`, `terms` and the random-number contract, with the review fixes | R1-R7, R10, R11 | agy's 1.16 bn, now with D against the engine. Done (agy_imp): 1.14-1.18 bn, D at every chain-count path. Asserts 2 moving bodies |
 | `many_movers` | hundreds of movers, generic PMI terms (NPC basket, mzIdentML) | the engine plus R1, R5 and R9 | R1, R5, R9-R11 | NPC basket > 11.5 M; mzIdentML > 67 M (incremental instead of full rescore) |
 | `collective` | every step moves every body (mature NPC) | `pm_sampler2.py`, moved onto `system`, `terms` and `run`, with its own step | R8, R10, R11 | ≥ 1.2 M; then batch or fuse the rebuilds. Done: `templates/collective/`, 1.06 M, the same as `pm_sampler2` measured the same way |
 
@@ -388,10 +388,12 @@ that have already been taken and checked.
     Progress). Arthur, 2026-11-03: a slower generic engine is fine as long
     as the path to a specialized sampler is clean (the section above).
 - **`few_bodies_beads`** reaches agy's speed and passes level D against the
-  engine in float64, in both chain-count regimes.
+  engine in float64, in both chain-count regimes. Met: 1.14-1.18 bn on one
+  L40 (agy measured 1.16-1.20 bn), 0 differing decisions at every chain
+  count where its code changes path.
 - **Every recipe** has its `check` call in one test script, which runs on a
-  GPU node in under 30 minutes. `tests/check_all.sh`: 12 minutes on one L40
-  with the core and `collective`; the recipes add their lines.
+  GPU node in under 30 minutes. Met: `tests/check_all.sh`, 20 minutes on one
+  L40 with the core, both templates and R1-R7.
 - **Documentation:** a "make a fast sampler for your system" page that walks
   through choosing a template, then adding recipes one at a time, checking D
   after each. GUIDE.md.
@@ -404,7 +406,7 @@ that have already been taken and checked.
 2. **`engine` + `check.decisions` + the random-number contract.** Benchmark
    against today's samplers on one L40. Done 2026-11-03.
 3. **`few_bodies_beads`:** port agy's sampler onto the core and fix the review
-   items. Write recipes R1-R7 from it.
+   items. Write recipes R1-R7 from it. Done 2026-11-03 by agy_imp.
 4. **`many_movers` and `collective`;** recipes R8-R11. Done 2026-11-03:
    `collective`, `jax_mc.run` (R10, R11) with RMF output and one process
    per GPU. `many_movers` isn't separate code for now. The engine already
@@ -413,7 +415,7 @@ that have already been taken and checked.
    and R11, which the driver does.
 5. **The guide;** clean up the old prototype directories, which keep working
    until the templates replace them. Guide and test script done
-   2026-11-03; the cleanup waits for `few_bodies_beads`.
+   2026-11-03. The cleanup is next (asking Arthur first).
 
 ## Decisions taken without asking (change any)
 
@@ -654,4 +656,41 @@ float32 precision:
   all pass in 12 minutes; 0 decisions differ anywhere. Float32 drift after
   50 sweeps: mzIdentML 1.5e-4, Pol II 6.9e-3 (EV), NPC basket 564 at an
   energy of 5e7 (the pairs term). `cpu` mode (no GPU) takes 1 minute.
+
+**Step 3 (2026-11-03, agy_imp): `templates/few_bodies_beads/` and
+`recipes/` R1-R7.** agy ported its Pol II sampler onto the System, the terms
+and the random-number contract, and wrote one page and one module per
+recipe, each with its level, asserted preconditions and a `factory` for
+`check`. Verified here on one L40:
+- **Level D, float64:** agy's 36 checks pass (R1-R4, R6, R7 and the
+  template, 1,024 and 8,192 chains, kT 1 and 10, `rotate`; the template in
+  `frozen` too). The template switches code paths by chain count (block
+  sizes, reuse of sweep-entry positions, the R6 precompute), and 1,024 and
+  8,192 don't reach all of them. Added: 4,096, 16,384, 32,768 and 65,536
+  chains, both covariance modes. 0 decisions differ anywhere.
+- **Speed, float32, 200 sweeps:**
+
+  | chains | template | engine |
+  |---|---|---|
+  | 4,096 | 586 M | 40 M |
+  | 16,384 | 1.15 bn | |
+  | 32,768 | 1.17 bn | 227 M |
+  | 65,536 | 1.18 bn | 264 M |
+
+- **Run driver:** 16,384 chains on a 4-rung ladder, 20 frames: float32
+  drift 0.009, and the energy at the lowest rung went from 1,569 to 638.
+- **Changes on merge:** R1's and R4's factories rebuild the system with
+  `extract(source, replace=...)` instead of copying it and swapping a term's
+  class (both checked: 0 differing decisions); R5's check, which ran the
+  plain engine, is dropped (its functions are checked through the template);
+  `recipes/check_all.py` runs the template at the extra chain counts;
+  `bench.hlo_copies` compiles with the state donated, as timed (agy's
+  note); lint.
+- **Limits, in the template's README:** exactly 2 moving bodies (the EM
+  cache pairs each body with the other), no NormalMovers, and thresholds
+  tuned on one L40.
+
+**The path from engine to template, measured on Pol II:** 264 M (generic
+engine) to 1.18 bn (template), with level D at every step. Recipes at level
+1 (R1, R4) drop into the engine unchanged through `extract(replace=...)`.
 

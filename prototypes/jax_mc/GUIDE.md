@@ -118,8 +118,13 @@ What was found on the systems so far:
 |---|---|---|
 | one term dominates (EV, EM) | a faster subclass of that term | 1 |
 | one kind of move dominates (many beads) | an `Engine` subclass for that group's branch | 2 |
-| few movers, cheap terms, launch-bound | `templates/few_bodies_beads` (Pol II; in progress) | 3 |
+| few movers, cheap terms, launch-bound | `templates/few_bodies_beads` (Pol II: 1.2 bn on one L40, 4.5× the engine) | 3 |
 | every mover moves at every step | `templates/collective` (mature NPC) | 3 |
+
+Each template's README says what system shape it fits, what it asserts,
+and which numbers are tuned to a GPU. `recipes/` has one page per technique
+(R1-R7 so far), with its level, preconditions and measured gain; most come
+from `few_bodies_beads`.
 
 **Level 1: a faster term.** Subclass the term, override `cache`,
 `move_tables` and `delta`, and build the system with it:

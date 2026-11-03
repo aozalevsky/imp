@@ -16,12 +16,13 @@ import numpy as np
 
 def hlo_copies(eng, st, sweeps):
     """number of copy instructions in the compiled run whose result has
-       X's shape"""
+       X's shape (compiled as timed, with the state donated, so the entry
+       copy of an undonated input isn't counted; agy_imp)"""
     import jax
     X = st['X']
     dt = {'float32': 'f32', 'float64': 'f64'}[str(X.dtype)]
     shape = f'{dt}[{",".join(str(n) for n in X.shape)}]'
-    txt = jax.jit(eng.run, static_argnums=(1, 2)).lower(
+    txt = jax.jit(eng.run, static_argnums=(1, 2), donate_argnums=0).lower(
         st, sweeps).compile().as_text()
     pat = re.compile(r'=\s*' + re.escape(shape) + r'(\{[^}]*\})?\s+copy\(')
     return sum(1 for line in txt.splitlines() if pat.search(line))

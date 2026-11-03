@@ -41,7 +41,14 @@ echo "### level D: templates against the reference engine (float64)"
 run python -m jax_mc.check decisions pm \
     --sampler templates.collective.sampler:factory \
     --chains 256 --ref-chains 16 --sweeps 200 --kT 300,3000
-# few_bodies_beads (Pol II) and recipes R1-R7: add their lines here
+# few_bodies_beads (Pol II) and recipes R1-R7 in one process: both regimes,
+# both covariance modes, and every chain count where the template's code
+# changes path (recipes/check_all.py)
+if [ "$MODE" = full ]; then
+    run python -m recipes.check_all
+else
+    run python -m recipes.check_all --template-chains ''
+fi
 
 if [ "$MODE" = full ]; then
     echo "### level F: float32 drift, reported only"
