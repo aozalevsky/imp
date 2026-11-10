@@ -1,10 +1,11 @@
 # jax_mc: a core plus recipes for fast, exact JAX Monte Carlo samplers
 
-Status, 2026-11-03: steps 1-4 are done (`system`, `terms`, `engine`,
-`check`, `bench`, `run`, `rmf`; `templates/collective`, and agy_imp's
-`templates/few_bodies_beads` with recipes R1-R7), and step 5's guide
-(GUIDE.md) and test script (`tests/check_all.sh`). Left: cleaning up the old
-prototype directories. See [Progress](#progress).
+Status, 2026-11-09: steps 1-4 are done (`system`, `terms`, `engine`,
+`check`, `bench`, `run`, `rmf`; `templates/collective`, agy_imp's
+`templates/few_bodies_beads` with recipes R1-R7, and `templates/many_movers`),
+and step 5's guide (GUIDE.md) and test script (`tests/check_all.sh`). A speed
+pass over the core on 2026-11-09 is the last entry of
+[Progress](#progress). Left: cleaning up the old prototype directories.
 
 ## Why
 
@@ -120,10 +121,12 @@ Each scoring term is one small class:
 
 ```python
 class Term:
-    rows_read, nuis_read                  # what it reads (engine skips
-                                          # terms a mover can't change)
+    rows_read, nuis_read                  # what it reads
     def full(self, st): ...               # (C,) energy per chain
     def cache(self, st): ...              # per-chain partial sums, or None
+    def touched(self, rows): ...          # how many of its items a mover of
+                                          # these rows changes (0: none)
+    SPLIT                                 # group movers by touched()
     def move_tables(self, s, moves): ...  # host tables, one row per mover
     def delta(self, tab, st, cache, mv): ...      # (dE (C,), new)
     def delta_nuis(self, st, cache, nuis): ...    # the same, nuisance move
@@ -167,9 +170,13 @@ The first set covers the four systems:
   - Chain-last is part of what made the Pol II struct-of-arrays sampler twice
     as fast on GPU (with the static-EV grid and no array copies).
 - **Sweep:** a `lax.scan` over the movers in SerialMover order. Movers are
-  grouped by kind (`ball`, `rb`, `transform`, `normal`) and size: the
-  number of rows, padded to a power of 2. Each group has its tables, one
-  row per mover, and its branch of a `lax.switch`. A branch:
+  grouped by kind (`ball`, `rb`, `transform`, `normal`), by size (the
+  number of rows, padded to a power of 2), and by what they cost in the
+  expensive terms: for each term with `SPLIT` (EV, cross-links, EM), how
+  many of its items the mover changes (`Term.touched`, rounded up to a
+  power of 4). A mover that changes none of a term's items is in a group
+  without that term. Each group has its tables, one row per mover, and its
+  branch of a `lax.switch`. A branch:
   1. proposes;
   2. asks the terms its group can change for `delta`;
   3. applies Metropolis;
@@ -177,7 +184,8 @@ The first set covers the four systems:
      rows].set(where(acc, new, old))`), and updates `E` and the caches.
 
   This works for any number of movers, and compile time grows with the
-  number of groups, not movers.
+  number of groups, not movers (NPC basket: 354 movers in 50 groups, about
+  80 s on one L40; Pol II: 49 in 11, 8 s).
 - **`Engine(s, incremental=False)`** is the same sampler with every term
   rescored from scratch after each proposal. It shares the proposals and
   draws, and is the reference for `check.decisions`.
@@ -320,7 +328,7 @@ adapts. Each one has:
 | template | system shape | starts from | recipes | target on one L40 |
 |---|---|---|---|---|
 | `few_bodies_beads` | few rigid bodies, many beads, fixed mover order (Pol II) | agy's `sampler_soa.py`, moved onto `system`, `terms` and the random-number contract, with the review fixes | R1-R7, R10, R11 | agy's 1.16 bn, now with D against the engine. Done (agy_imp): 1.14-1.18 bn, D at every chain-count path. Asserts 2 moving bodies |
-| `many_movers` | hundreds of movers, generic PMI terms (NPC basket, mzIdentML) | the engine plus R1, R5 and R9 | R1, R5, R9-R11 | NPC basket > 11.5 M; mzIdentML > 67 M (incremental instead of full rescore) |
+| `many_movers` | many movers of many shapes, generic PMI terms (NPC basket, mzIdentML) | the engine, with its sweep unrolled | R2, R10, R11 | NPC basket > 11.5 M; mzIdentML > 67 M. Done 2026-11-09: 75.1 M (NPC basket) and 2.64 bn (mzIdentML), same decisions as the engine |
 | `collective` | every step moves every body (mature NPC) | `pm_sampler2.py`, moved onto `system`, `terms` and `run`, with its own step | R8, R10, R11 | ≥ 1.2 M; then batch or fuse the rebuilds. Done: `templates/collective/`, 1.06 M, the same as `pm_sampler2` measured the same way |
 
 ## From the engine to a specialized sampler
@@ -424,7 +432,7 @@ that have already been taken and checked.
   `jax_mc_npc_basket` stay as they are until the templates match them.
 - **Plain JAX only in the core.** Pallas stays a recipe.
 - **The engine's sweep is dynamic** (scan + switch), not unrolled.
-  Unrolling is recipe R2.
+  Unrolling is recipe R2; `templates/many_movers` is the engine with it.
 - **The random-number contract** (`fold_in` per sweep, 3 uniforms and 6
   normals per mover). The existing Pol II and NPC samplers draw differently, so their
   old trajectories won't be reproduced. Level D is checked between samplers
@@ -711,3 +719,106 @@ NPC) and 396k (Pol II, core 158k), so specializing pays on the CPU too.
 mzIdentML and the NPC basket run on the core only. Next for the core: a
 neighbour-list EV (from the collective template's R8) above some bead
 count.
+
+**Speed pass over the core (2026-11-09).** `python -m jax_mc.prof` (new)
+times the steps of each kind of mover and what each term costs in them.
+On the NPC basket (16,384 chains, one L40) a bead move took 703 µs:
+bayesianem EM 77%, EV 20%, cross-links 8%; a body move 1,129 µs: EM 59%,
+EV 30%. Four changes followed, each with level D kept (0 decisions differ
+in every check of `tests/check_all.sh`, now 30 minutes on one L40):
+
+1. **bayesianem EM scores only the Gaussians that moved.** It used to
+   rescore the block of 16 Gaussians around a moved one (to stay exact in
+   float32). Now the cache holds every Gaussian's overlaps with the
+   densities, and their per-density sums as compensated sums (`geom.xadd`,
+   Shewchuk's grow-expansion: 3 float32 or 2 float64 components). A move
+   computes its own Gaussians' new overlaps, reads their old ones back
+   from the cache, and updates the sums. A term added and later
+   subtracted leaves no residue: after 400 terms between 1e-14 and 30 were
+   added and removed again in another order, the 1e-12 that should be left
+   was right to 1.5e-7 in float32 (plain running sum: off by 3e8 times)
+   and to 1e-16 in float64, the same on CPU and GPU. Float32 drift of the
+   term after 50 sweeps: 9.8e-4 (before: 7e-4). The cache is 96 kB per
+   chain on the NPC basket (304 Gaussians × 79 densities).
+2. **A mover pays for its own size.** A group's tables are padded to its
+   largest mover. On the NPC basket one bead has 31 cross-links while 195
+   of 309 have none, and 127 beads have no EM Gaussian. Terms now say how
+   many of their items a mover changes (`Term.touched`), and for the
+   costly ones (`SPLIT`: EV, cross-links, EM) the engine groups movers by
+   that count, rounded up to a power of 4. A mover that changes nothing in
+   a term skips it. NPC basket: 9 groups became 50, and the compile went
+   from 25 s to 80 s. Powers of 2 (71 groups, 100 s) were no faster.
+3. **XLA's CPU backend and masks that are true everywhere.** With (2), a
+   Pol II body is alone in its group and its EV mask against the static
+   particles is true everywhere. XLA folds the mask away, and its CPU
+   backend (jaxlib 0.11) then ran the reduction that was left 12 times
+   slower, which made the whole sweep 34% slower on one CPU core. On the
+   CPU the static particles get one more entry that never counts
+   (`SoftSphereEV._static_pad`); on a GPU the folded mask saves a kernel
+   and nothing is added.
+4. **`templates/many_movers`: the engine, unrolled.** The engine's
+   `lax.switch` costs about 25 µs per MC step on the GPU (the branch index
+   is read back before the step's kernels are queued), and every table
+   lookup by mover index is a small kernel of its own (11 of the 28
+   kernels of an NPC basket bead move). Recipe R2 removes both. It now
+   takes any number of movers, and a mover whose rows aren't one slice
+   (the NPC basket's two `TransformMover`s) falls back to the engine's
+   step with constant tables. The template is that and nothing else, so
+   it fits any SerialMover system. Energies and positions equal the
+   engine's on mzIdentML and Pol II, and agree to 3e-8 on the NPC basket.
+   The price is compile time: 5.5 minutes for the NPC basket's 354 movers.
+
+MC steps/s, float32, before (2026-11-03) and after:
+
+| system | sampler | where | before | after |
+|---|---|---|---|---|
+| mzIdentML | core | one CPU core, 1 chain | 719 k | 942 k |
+| | core | one L40, 1 chain | 19.2 k | 20.3 k |
+| | core | one L40, best chain count | 1.11 bn (262,144) | 1.19 bn (262,144) |
+| | `many_movers` | one L40, best chain count | | 2.64 bn (131,072) |
+| NPC basket | core | one CPU core, 1 chain | 49.2 k | 61.6 k |
+| | core | one L40, 1 chain | 7.4 k | 8.7 k |
+| | core | one L40, best chain count | 20.6 M (65,536) | 54.3 M (8,192) |
+| | `many_movers` | one L40, best chain count | | 75.1 M (8,192) |
+| Pol II | core | one CPU core, 1 chain | 158 k | 207 k |
+| | core | one L40, 1 chain | 12.2 k | 13.1 k |
+| | core | one L40, best chain count | 265 M (65,536) | 319 M (65,536) |
+
+The mature NPC's samplers and Pol II's template (1.18 bn) didn't change.
+On one CPU core, `many_movers` is slower than the core on mzIdentML (764 k
+against 942 k): unrolling is a GPU technique.
+
+**Things learned:**
+- **The best chain count is where the hot arrays stay in the GPU's
+  cache.** The NPC basket's EV reads 83 MB of positions per step at
+  16,384 chains. With the EM term left out of a bead move, EV takes about
+  47 µs of it; with EM in, whose kernels cycle through 1.6 GB of cache
+  rows over a sweep, leaving EV out saves 160 µs. After the EM fix the
+  best chain count moved from 65,536 to 8,192-12,288.
+- **At those chain counts a step costs about 4 µs per kernel**, whatever
+  the kernel does: 28 kernels for a bead move with EM and EV, 13 for one
+  with EV only. Fewer kernels per step is what is left to gain, which is
+  what the templates do.
+- **Tried and dropped:** splitting the EV reduction into chunks to give
+  its kernel more threads (slower: XLA's reductions already run in
+  parallel over the reduced axis); old and new positions in one pass (no
+  change: XLA already fuses the two); in-place updates of the small EM
+  sums so that other branches don't copy them (no change); one loop per
+  run of same-group movers instead of the switch (Pol II +30%, but each
+  loop boundary copies the state: NPC basket 38% slower).
+- **Mature NPC, not improved:** (a) rejecting early from a lower bound.
+  The cheap terms decide nothing there: a proposal changes EV by +664 on
+  average and everything else by less than 1, so the bound needs 91% of
+  the EV pairs. (b) Rebuilding the inner lists of 8 chains in one batch:
+  slower (955k against 1.03 M at 1,024 chains): a rebuild is bound by
+  the work on its 213k outer pairs, not by kernel launches.
+
+**Next:**
+- NPC basket: score several beads in one kernel (R3). Its beads carry EM
+  Gaussians and ambiguous cross-links, which R3 doesn't cover yet. Body
+  moves are now a third of a sweep (EV over 4 to 8 moved particles, EM
+  over up to 12 Gaussians).
+- Core: precomputed per-mover radius sums and EM pair constants would
+  remove about 8 of the 28 kernels of a bead move without unrolling.
+- Mature NPC: a neighbour-list EV in the core (the template's R8), and a
+  cheaper list rebuild in the template (35% of its step).

@@ -8,6 +8,11 @@ and, for the incremental engine (jax_mc.engine):
 
     cache(st)                       per-chain partial sums the term keeps
                                     (None if it keeps none)
+    touched(rows)                   how many of its items a mover of these
+                                    rows changes (0: none). With SPLIT, the
+                                    engine groups movers by it, so a mover
+                                    is padded to its own size class and
+                                    skips the term where it is 0
     move_tables(s, moves)           host tables, one row per mover of a group
     delta(tab, st, cache, mv)       (dE (C,), new) for a coordinate move mv
                                     (engine.Move); new is None (cache
@@ -52,6 +57,9 @@ class Term:
     name = 'term'
     rows_read = None            # np array of rows, None: all
     nuis_read = None            # np array of nuisance indexes, None: all
+    SPLIT = False               # group movers by touched(): for terms whose
+    #                             cost per item matters (every group is one
+    #                             more branch to compile)
 
     def __init__(self, key):
         self.key = key
@@ -73,6 +81,12 @@ class Term:
     # ---- incremental interface (jax_mc.engine) ------------------------
     def cache(self, st):
         return None
+
+    def touched(self, rows):
+        """number of this term's items that a mover of `rows` changes: the
+           width its tables need for that mover"""
+        return int(self.rows_read is None
+                   or np.isin(self.rows_read, rows).any())
 
     def move_tables(self, s, moves):
         """moves: [(rows, bodies)] for the movers of one group, rows in
@@ -109,6 +123,9 @@ class RowTerm(Term):
     def full(self, st):
         q = np.arange(len(self.rows))
         return jnp.sum(self.energies(q, st['X'][:, self.rows]), axis=0)
+
+    def touched(self, rows):
+        return int(np.isin(self.rows, rows).sum())
 
     def move_tables(self, s, moves):
         items, sl = [], []

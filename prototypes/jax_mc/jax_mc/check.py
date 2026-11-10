@@ -115,8 +115,13 @@ def compare(a, b, sweeps=5, chains=16, kTs=(1.0,), seed=0, ref_chains=None,
         f'{"float64" if jax.config.jax_enable_x64 else "float32"}, '
         f'{jax.devices()[0].device_kind}')
     if hasattr(a, 'groups'):
-        out('  groups: ' + ', '.join(f'{G.kind} x{len(G.movers)}'
-                                     for G in a.groups))
+        n = {}
+        for G in a.groups:
+            c = n.setdefault(G.kind, [0, 0])
+            c[0] += len(G.movers)
+            c[1] += 1
+        out('  groups: ' + ', '.join(f'{k} x{c[0]} in {c[1]}'
+                                     for k, c in n.items()))
     res = []
     for kT in kTs:
         sa, sb = a.init(chains, seed, kT), b.init(R, seed, kT)

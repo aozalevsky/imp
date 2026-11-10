@@ -81,6 +81,9 @@ class Pairs(Term):
         return jnp.sum(self.energies(q, X[:, self.ri], X[:, self.rj]),
                        axis=0)
 
+    def touched(self, rows):
+        return int((np.isin(self.ri, rows) ^ np.isin(self.rj, rows)).sum())
+
     def move_tables(self, s, moves):
         """pairs with exactly one end moved (the mover is rigid on its
            rows, so pairs inside it don't change), and the slots of their
@@ -116,6 +119,7 @@ class SoftSphereEV(Term):
        CloseBipartitePairContainer. The score is zero for pairs that don't
        overlap, so it doesn't depend on the close-pair list."""
     name = 'ev'
+    SPLIT = True
     DENSE_MAX = 2048            # rows; above this, full() works in blocks
 
     @classmethod
@@ -222,6 +226,9 @@ class SoftSphereEV(Term):
                                 jnp.zeros(C, X.dtype))
         return 0.5 * self.kk * acc
 
+    def touched(self, rows):
+        return int(np.isin(self.rows, rows).sum())
+
     def move_tables(self, s, moves):
         """the mover's rows that are EV particles (EV index, slot), and which
            pairs (moved particle, other particle) count: different labels,
@@ -243,8 +250,20 @@ class SoftSphereEV(Term):
             la = self.lab[np.minimum(a, n - 1)]
             keep[i] = ok[:, None] & ~moved[None] & (la[:, None] !=
                                                     self.lab[None])
-        return dict(idx=idx, slot=pad(sl, 0), keep_s=keep[..., :ns],
+        keep_s = np.concatenate([keep[..., :ns], np.zeros(
+            keep.shape[:2] + (self._static_pad(),), bool)], -1)
+        return dict(idx=idx, slot=pad(sl, 0), keep_s=keep_s,
                     keep_m=keep[..., ns:])
+
+    def _static_pad(self):
+        """1 on the CPU: the static particles then get one more entry that
+           never counts. Without it, a mover whose particles pair with
+           every static one has a mask that is true everywhere; XLA drops
+           the select, and its CPU backend (jaxlib 0.11) runs the reduction
+           that is left about 10 times slower (Pol II's body moves). On a
+           GPU the dropped select saves a kernel, so nothing is added."""
+        import jax
+        return int(self.n_static > 0 and jax.default_backend() == 'cpu')
 
     def delta(self, tab, st, cache, mv):
         """moved particles against all unmoved ones (pairs among moved
@@ -252,8 +271,10 @@ class SoftSphereEV(Term):
            particles are read from one copy shared by all chains."""
         n, ns = len(self.rows), self.n_static
         ri = jnp.asarray(self.r)[jnp.minimum(tab['idx'], n - 1)]
-        parts = [(jnp.asarray(self.xs0)[..., None], self.r[:ns],
-                  tab['keep_s']),
+        k = self._static_pad()
+        xs = np.concatenate([self.xs0, np.zeros((3, k))], 1)
+        rs = np.concatenate([self.r[:ns], np.zeros(k)])
+        parts = [(jnp.asarray(xs)[..., None], rs, tab['keep_s']),
                  (st['X'][:, self.rows[ns:]], self.r[ns:], tab['keep_m'])]
 
         def e(xi):                                          # (3, A, C)
@@ -275,6 +296,7 @@ class CrossLinks(Term):
        sigma and psi nuisances): w * sum_r -log(w_r * p_r), with
        p_r = 1 - prod_c (1 - term_c)"""
     name = 'xl'
+    SPLIT = True
     CPP_FLOAT = False           # check.terms sets it to match C++ exactly
 
     @classmethod
@@ -394,6 +416,15 @@ class CrossLinks(Term):
                                 - self.energies(res, d, st['nuis']),
                                 axis=0), cache
 
+    def _crossing(self, rows):
+        """per contribution (plus one False for the padding index): exactly
+           one of its ends is in rows"""
+        return np.concatenate([np.isin(self.ca, rows)
+                               ^ np.isin(self.cb, rows), [False]])
+
+    def touched(self, rows):
+        return int(self._crossing(rows)[self.con].any(axis=1).sum())
+
     def move_tables(self, s, moves):
         """restraints with a contribution that has exactly one end moved,
            and for those contributions the slots of the ends (-1: use the
@@ -402,9 +433,7 @@ class CrossLinks(Term):
         res, sa, sb = [], [], []
         for rows, _ in moves:
             slot = slots(rows)
-            a = np.isin(self.ca, rows)
-            b = np.isin(self.cb, rows)
-            cross = np.concatenate([a ^ b, [False]])        # nc = padding
+            cross = self._crossing(rows)                    # nc = padding
             q = np.nonzero(cross[self.con].any(axis=1))[0]
             res.append(q)
             sa.append([[slot.get(int(self.ca[c]), -1) if cross[c] else -1

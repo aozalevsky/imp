@@ -4,11 +4,13 @@ One MC step proposes one mover, in IMP's SerialMover order, as IMP's
 MonteCarlo does with a SerialMover; a sweep is one step for every mover.
 All chains do the same mover at the same time.
 
-The sweep is a lax.scan over the movers. Movers are grouped by kind and
-size (rows, padded to a power of 2), each group has its tables (one row
-per mover) and its branch of a lax.switch. A branch proposes, asks the
-terms its mover can change for their energy change (Term.delta), applies
-Metropolis, and writes the accepted rows back by a masked select.
+The sweep is a lax.scan over the movers. Movers are grouped by kind, size
+(rows, padded to a power of 2), and, for the costly terms (Term.SPLIT), by
+how many of the term's items they change (Term.touched, rounded up to a
+power of SIZE_BASE; 0: the term is left out). Each group has its tables
+(one row per mover) and its branch of a lax.switch. A branch proposes,
+asks the terms its movers change for their energy change (Term.delta),
+applies Metropolis, and writes the accepted rows back by a masked select.
 
 Engine(s, incremental=False) is the same sampler with full rescores: the
 same proposals and draws, but every term rescored from scratch with the
@@ -47,6 +49,7 @@ Moves, as IMP makes them:
              their number of members) / (count), y -> R_r (y - c) + c + v
   normal     a nuisance
 """
+import math
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -151,6 +154,7 @@ class Group:
 
 class Engine:
     """the reference sampler for SerialMover systems (see the module doc)"""
+    SIZE_BASE = 4               # table widths within a group: within 4x
 
     def __init__(self, s, incremental=True):
         if s.mode != 'serial':
@@ -176,7 +180,7 @@ class Engine:
                 k = ('ball', 1, 0)
             else:
                 k = (mv.kind, _bucket(len(mv.rows)), _bucket(len(mv.bodies)))
-            keys.setdefault(k, []).append(i)
+            keys.setdefault(k + self._sizes(mv), []).append(i)
         self.groups = [self._group(k, v) for k, v in
                        sorted(keys.items(), key=lambda kv: kv[1][0])]
         n = len(s.movers)
@@ -189,17 +193,39 @@ class Engine:
         self.steps_per_sweep = n
 
     # ---------------- host tables ---------------------------------------
+    def _sizes(self, mv):
+        """per term, for the group key: how many of its items the mover
+           changes, rounded up to a power of SIZE_BASE (0: none), for terms
+           with SPLIT; -1 for the others (they are in a group's steps if
+           any of its movers changes them). So a group holds movers of one
+           kind that need about the same table widths in the costly
+           terms."""
+        if not self.incremental:
+            return ()
+        s = self.s
+        if mv.kind == 'normal':
+            nu = s.nuis_of[int(s._moved_nuis_order[mv.nuis])]
+            return tuple(int(t.nuis_read is None or nu in t.nuis_read)
+                         for t in self.terms)
+        rows = np.array(mv.rows, np.int64)
+        b = self.SIZE_BASE
+
+        def size(t):
+            n = t.touched(rows)
+            return b ** math.ceil(math.log(n, b) - 1e-9) if n else 0
+        return tuple(size(t) if t.SPLIT else -1 for t in self.terms)
+
     def _group(self, key, movers):
         s = self.s
         kind = key[0]
         mvs = [s.movers[i] for i in movers]
+        terms = [ti for ti, n in enumerate(key[3:]) if n > 0 or (
+            n < 0 and any(self.terms[ti].touched(np.array(mv.rows, np.int64))
+                          for mv in mvs))]
         if kind == 'normal':
             nus = [s.nuis_of[int(s._moved_nuis_order[mv.nuis])] for mv in mvs]
             tab = dict(nuis=np.array(nus, np.int64),
                        sigma=np.array([mv.sigma for mv in mvs]))
-            terms = [ti for ti, t in enumerate(self.terms)
-                     if t.nuis_read is None
-                     or np.isin(t.nuis_read, nus).any()]
             return Group(kind, movers, tab, terms)
         M, KB = key[1], max(key[2], 1)
         rk, rr = s.row_kind, s.row_ref
@@ -233,9 +259,6 @@ class Engine:
                    rot=np.array([mv.max_rot for mv in mvs]))
         moves = [(np.array(mv.rows, np.int64), [int(b) for b in mv.bodies])
                  for mv in mvs]
-        terms = [ti for ti, t in enumerate(self.terms)
-                 if t.rows_read is None
-                 or any(np.isin(t.rows_read, r).any() for r, _ in moves)]
         G = Group(kind, movers, tab, terms)
         if self.incremental:
             G.term_tabs = {ti: self.terms[ti].move_tables(s, moves)
@@ -257,7 +280,9 @@ class Engine:
                 else:
                     d, new[ti] = t.delta_nuis(st, c, nuis)
                 dEs.append((ti, d))
-            dE = sum(d for _, d in dEs)
+            dE = jnp.zeros_like(kT)     # a mover may change no term at all
+            for _, d in dEs:
+                dE = dE + d
             acc = u[2] < jnp.exp(-dE / kT)
             upd = [jnp.zeros_like(dE)] * len(self.terms)
             for ti, d in dEs:

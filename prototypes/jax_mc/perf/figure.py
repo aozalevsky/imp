@@ -44,20 +44,35 @@ def draw(rows, names, order, bars, path, title=None, note=None, sub=None,
         off += [(k0 + i + sep * j) * w for i in range(b)]
         k0 += b
     off = [o - (off[0] + off[-1]) / 2 for o in off]
+    val = {(r['system'], r['bar']): r['steps_per_s'] for r in rows}
     for k, bar in enumerate(bars):
-        xs, ys, labels = [], [], []
-        for i, s in enumerate(systems):
-            r = [r for r in rows if r['system'] == s and r['bar'] == bar]
-            if not r:
-                continue
-            r = r[0]
-            xs.append(i + off[k])
-            ys.append(r['steps_per_s'])
-            labels.append(fmt(r['steps_per_s']))
+        xs = [i + off[k] for i, s in enumerate(systems) if (s, bar) in val]
+        ys = [val[s, bar] for s in systems if (s, bar) in val]
         ax.bar(xs, ys, width=w - gap, color=COLORS[k], label=bar, zorder=3)
-        for x, y, lab in zip(xs, ys, labels):
-            ax.text(x, y * 1.12, lab, ha='center', va='bottom', fontsize=7,
-                    color=INK, zorder=4)
+    # value labels. A long label next to another long one at about the
+    # same height goes one line up; one wider than its column is aligned
+    # away from a taller neighbour.
+    line = 2.3                           # a label's height, as a factor
+    for i, s in enumerate(systems):
+        prev = None
+        for k, bar in enumerate(bars):
+            if (s, bar) not in val:
+                prev = None
+                continue
+            lab, y = fmt(val[s, bar]), val[s, bar] * 1.12
+            if prev and len(lab) + len(prev[1]) > 10 and \
+                    prev[0] / line < y < prev[0] * line:
+                y = prev[0] * line
+            x, ha = i + off[k], 'center'
+            near = [val.get((s, bars[j]), 0.) if 0 <= j < len(bars) else 0.
+                    for j in (k - 1, k + 1)]
+            if len(lab) >= 6 and near[1] > y:
+                x, ha = x + (w - gap) / 2, 'right'
+            elif len(lab) >= 6 and near[0] > y:
+                x, ha = x - (w - gap) / 2, 'left'
+            ax.text(x, y, lab, ha=ha, va='bottom', fontsize=7, color=INK,
+                    zorder=4)
+            prev = (y, lab)
     ax.set_yscale('log')
     lo = min(r['steps_per_s'] for r in rows)
     hi = max(r['steps_per_s'] for r in rows)

@@ -16,6 +16,52 @@ def norm(v):
     return jnp.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
 
 
+def two_sum(a, b):
+    """s, e with a + b = s + e exactly (s the rounded sum; Knuth)"""
+    s = a + b
+    bb = s - a
+    return s, (a - (s - bb)) + (b - bb)
+
+
+def limbs(dtype):
+    """components a compensated sum needs so that a term of order 100,
+       added and later subtracted, leaves nothing next to 1e-10: 2 in
+       float64 (106 bits), 3 in float32 (72 bits)"""
+    return 2 if jnp.dtype(dtype) == jnp.float64 else 3
+
+
+def xadd(c, x):
+    """c + x for a compensated sum c: a list of components, smallest
+       first, whose exact sum is the value (c[-1] is the value to within
+       one unit in its last place). Shewchuk's grow-expansion, then the
+       errors are renormalized from the top and the last two are added,
+       so len(c) components stay."""
+    q, h = x, []
+    for v in c:
+        q, e = two_sum(q, v)
+        h.append(e)
+    out, t = [q], h[-1]
+    for e in h[-2:0:-1]:
+        t, r = two_sum(t, e)
+        out.append(t)
+        t = r
+    out.append(t + h[0])
+    return out[::-1]
+
+
+def xsum(a, k):
+    """compensated sum, k components, of a over its first axis (pairwise)"""
+    c = [jnp.zeros_like(a)] * (k - 1) + [a]
+    while c[0].shape[0] > 1:
+        if c[0].shape[0] % 2:
+            c = [jnp.concatenate([v, jnp.zeros_like(v[:1])]) for v in c]
+        out = [v[0::2] for v in c]
+        for v in c:
+            out = xadd(out, v[1::2])
+        c = out
+    return [v[0] for v in c]
+
+
 def quat_to_rot(q):
     """(4, ...) unit quaternions (w, x, y, z) -> (3, 3, ...), as Eigen's
        toRotationMatrix (what IMP::algebra::Rotation3D and core::Gaussian

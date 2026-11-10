@@ -38,7 +38,8 @@ def bench(s, chains, sweeps, seed=0, incremental=True, hlo=False,
     eng = make(s, incremental) if sampler is None else sampler(s)
     n = eng.steps_per_sweep                 # MC steps per sweep
     run = jax.jit(eng.run, static_argnums=(1, 2), donate_argnums=0)
-    out(f'{s.name}: {len(s.movers)} movers, {type(eng).__name__}, '
+    groups = f' in {len(eng.groups)} groups' if hasattr(eng, 'groups') else ''
+    out(f'{s.name}: {len(s.movers)} movers{groups}, {type(eng).__name__}, '
         f'{len(s.terms)} terms, {eng.dtype().__name__}, '
         f'{"incremental" if eng.incremental else "full rescore"}, '
         f'{jax.devices()[0].device_kind}')

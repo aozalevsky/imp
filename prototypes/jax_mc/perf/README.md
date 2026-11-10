@@ -19,10 +19,11 @@ count, the template at its best chain count):
   count that gave the most MC steps/s.
 - **JAX template, 1 CPU core** and **JAX template, 1 GPU, best chain
   count**: the system's template, built on the core with its recipes:
-  `templates/few_bodies_beads` (Pol II, recipes R1-R7) and
-  `templates/collective` (mature NPC, its own neighbour lists, closed-form
-  overall position, EM pair tables and membrane candidates). mzIdentML and
-  the NPC basket have no template yet; their best is the core.
+  `templates/many_movers` (mzIdentML and the NPC basket: the engine with
+  its sweep unrolled, recipe R2), `templates/collective` (mature NPC, its
+  own neighbour lists, closed-form overall position, EM pair tables and
+  membrane candidates) and `templates/few_bodies_beads` (Pol II, recipes
+  R1-R7).
 
 The chain counts tried are in `run.sh`. The mature NPC's MC step moves all
 112 bodies, in C++ and in JAX. Its C++ and template runs are timed after
@@ -35,9 +36,18 @@ template, which does 1,612 on one CPU core.
 
 For mzIdentML, the NPC basket and Pol II, the core engine is slower with
 one chain on the GPU than on one CPU core: a lone chain leaves the GPU
-waiting on kernel launches. The GPU pays off with many
-chains. Pol II and the mature NPC lose speed past their best chain count
-(all counts are in `results.jsonl`).
+waiting on kernel launches. The GPU pays off with many chains, up to the
+count where the arrays a step reads no longer stay in the GPU's cache
+(8,192 chains for the NPC basket); all counts are in `results.jsonl`.
+Unrolling (`many_movers`) is a GPU technique: on one CPU core the
+mzIdentML template is slower than the core engine, and the NPC basket's
+has no bar (its 354 unrolled movers didn't finish compiling on one core
+within 39 minutes).
+
+The C++, mature NPC and Pol II template records are from 2026-11-03; the
+core-engine records of mzIdentML, the NPC basket and Pol II and the
+`many_movers` records are from 2026-11-09, after the changes described in
+DESIGN.md ("Speed pass over the core").
 
 Reproduce (from `prototypes/jax_mc`, on a GPU node):
 

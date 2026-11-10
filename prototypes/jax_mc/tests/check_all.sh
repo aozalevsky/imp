@@ -41,6 +41,17 @@ echo "### level D: templates against the reference engine (float64)"
 run python -m jax_mc.check decisions pm \
     --sampler templates.collective.sampler:factory \
     --chains 256 --ref-chains 16 --sweeps 200 --kT 300,3000
+# many_movers: the engine unrolled (mzIdentML; the NPC basket takes 5
+# minutes to compile, so only in the full run)
+run python -m jax_mc.check decisions mzid \
+    --sampler templates.many_movers.sampler:factory \
+    --chains 1024 --ref-chains 256 --sweeps 5 --kT 1,10
+[ "$MODE" = full ] && run python -m jax_mc.check decisions mzid \
+    --sampler templates.many_movers.sampler:factory \
+    --chains 8192 --ref-chains 128 --sweeps 3 --kT 1
+[ "$MODE" = full ] && run python -m jax_mc.check decisions npc \
+    --sampler templates.many_movers.sampler:factory \
+    --chains 1024 --ref-chains 256 --sweeps 5 --kT 1,10
 # few_bodies_beads (Pol II) and recipes R1-R7 in one process: both regimes,
 # both covariance modes, and every chain count where the template's code
 # changes path (recipes/check_all.py)

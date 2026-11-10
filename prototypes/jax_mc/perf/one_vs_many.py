@@ -41,8 +41,8 @@ import numpy as np
 
 SAMPLERS = dict(polii='templates.few_bodies_beads.sampler:factory',
                 pm='templates.collective.sampler:factory',
-                npc=None,                        # the reference engine
-                mzid=None)
+                npc='templates.many_movers.sampler:factory',
+                mzid='templates.many_movers.sampler:factory')
 NAMES = dict(mzid='mzIdentML', npc='NPC basket', pm='mature NPC',
              polii='Pol II')
 ORDER = ('mzid', 'npc', 'pm', 'polii')
@@ -215,11 +215,12 @@ def plot(a):
             f'on' + (f' (off for the {", ".join(off)})' if off else '') +
             f'. JAX {", ".join(jx)}, float32, on one CPU core or one '
             f'{", ".join(gpu)}. JAX core: the generic engine. JAX template: '
-            'templates/few_bodies_beads (Pol II) and templates/collective '
-            '(mature NPC); mzIdentML and the NPC basket have none yet. A '
-            'mature NPC step moves all 112 bodies, in C++ and in JAX; its '
-            'core engine scores all 520 M bead pairs per step (no neighbour '
-            'lists), C++ and the template only close pairs.')
+            'templates/many_movers (mzIdentML, NPC basket: the engine with '
+            'its sweep unrolled), templates/collective (mature NPC) and '
+            'templates/few_bodies_beads (Pol II). A mature NPC step moves '
+            'all 112 bodies, in C++ and in JAX; its core engine scores all '
+            '520 M bead pairs per step (no neighbour lists), C++ and the '
+            'template only close pairs.')
     sub = {}
     for sysn in ORDER:
         best = {r['bar']: r['chains'] for r in R

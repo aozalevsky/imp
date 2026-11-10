@@ -92,13 +92,18 @@ every 15 minutes and the 20 best snapshots written as RMF. Restart with
 or under mpirun or srun. Together they are exactly one run.
 
 **If the engine is fast enough, stop here.** It beat the hand-written
-samplers on the NPC basket and on mzIdentML.
+samplers on the NPC basket and on mzIdentML. For more without writing
+anything, pass `--sampler templates.many_movers.sampler:factory` to the
+same tools: the same engine with its sweep unrolled.
 
 ## 3. Specialize, one checked step at a time
 
 ### Find where the time goes
 
 Before writing anything, profile one sweep:
+- `python -m jax_mc.prof mysys --chains 16384` times the steps of each
+  kind of mover, and how much each term's energy change costs in them
+  (by leaving it out);
 - `jax.profiler.trace` around a few `run` calls, then look at the largest
   kernels;
 - `python -m jax_mc.bench mysys --hlo` counts the array copies in the
@@ -108,7 +113,7 @@ What was found on the systems so far:
 
 | system | where the time went |
 |---|---|
-| NPC basket | EV 30%, isd EM 32%, cheap terms 23%, overhead 22% |
+| NPC basket | bayesianem EM was 77% of a bead move: it rescored 16 Gaussians when one had moved. Fixed in the core (2026-11-09); now EM and EV share a bead move about equally |
 | mature NPC | neighbour-list rebuilds 28%; the rest is the full energy |
 | Pol II | kernel launches per sweep (a few cheap movers on many chains) |
 
@@ -116,6 +121,7 @@ What was found on the systems so far:
 
 | your system | start from | level |
 |---|---|---|
+| many movers of many shapes, nothing else to exploit | `templates/many_movers`: the engine unrolled, for any SerialMover system (mzIdentML 2.2×, NPC basket 1.4× the engine on one L40; compile time grows with the movers) | 3 |
 | one term dominates (EV, EM) | a faster subclass of that term | 1 |
 | one kind of move dominates (many beads) | an `Engine` subclass for that group's branch | 2 |
 | few movers, cheap terms, launch-bound | `templates/few_bodies_beads` (Pol II: 1.2 bn on one L40, 4.5× the engine) | 3 |
@@ -209,11 +215,30 @@ For every change:
 
 ## 4. Pitfalls already met
 
-- **Float32 sums that cancel.** isd EM's log of a sum drifted by 3 kT with
-  running sums. Recomputing blocks of 16 from positions fixed it.
+- **Float32 sums that cancel.** bayesianem EM's log of a sum drifted by
+  3 kT with plain running sums: a density's sum can be near 0 next to
+  single overlaps of order 10. The term keeps each Gaussian's overlaps and
+  their sum as a compensated sum (`geom.xadd`: 3 components in float32, 2
+  in float64), so an overlap added and later subtracted leaves nothing.
   Large energies (1e8 on the NPC basket) drift by about 200 in float32.
   Decisions use differences, so that's harmless, but rescore every frame
   (`--rescore-every 1`).
+- **Padding to the largest mover.** A group's tables are as wide as its
+  largest mover needs, and every mover of the group pays for that width.
+  On the NPC basket one bead has 31 cross-links, 195 of 309 have none, and
+  127 have no EM Gaussian. A term with `SPLIT = True` makes the engine
+  group movers by `touched()`, so each pays about its own size.
+- **More chains isn't always more speed.** The best chain count is the
+  largest whose hot arrays stay in the GPU's cache. On the NPC basket (one
+  L40) that is 8,192 to 12,288 chains: at 16,384 the positions the EV term
+  reads at every step (83 MB) are pushed out by the EM kernels between two
+  steps, and both get slower. Scan the chain count after every change.
+- **Kernels that change with the data they are compiled for.** XLA folds
+  a mask that is true everywhere, and its CPU backend then ran the
+  reduction that was left 10 times slower (jaxlib 0.11, Pol II's body
+  moves; `SoftSphereEV._static_pad`). When a change that removes work
+  makes a step slower, compare the compiled programs
+  (`jit(...).lower(...).compile().as_text()`).
 - **Compile time growing with chains:** XLA's GPU autotuning.
   `jax_mc.xla_defaults()` turns it off. Call it before importing JAX in any
   new script.

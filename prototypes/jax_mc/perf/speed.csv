@@ -1,14 +1,17 @@
 system,configuration,chains,mc_steps_per_s,x_vs_cpp_release,detail
 mzIdentML,C++ release,1,194027,1,score_moved on; IMP 20261103.develop.74ba496d88; check level 1
 mzIdentML,C++ fast,1,254400,1.311,score_moved on; IMP 20261103.develop.74ba496d88; check level 0
-mzIdentML,"JAX core, 1 CPU core",1,718964,3.705,Engine; cpu; float32; acceptance 0.86
-mzIdentML,"JAX core, 1 GPU, 1 chain",1,19183.1,0.09887,Engine; NVIDIA L40; float32; acceptance 0.86
-mzIdentML,"JAX core, 1 GPU, best chain count",262144,1.10576e+09,5699,Engine; NVIDIA L40; float32; acceptance 0.91
+mzIdentML,"JAX core, 1 CPU core",1,941896,4.854,Engine; cpu; float32; acceptance 0.86
+mzIdentML,"JAX template, 1 CPU core",1,763923,3.937,ManyMovers; cpu; float32; acceptance 0.86
+mzIdentML,"JAX core, 1 GPU, 1 chain",1,20316,0.1047,Engine; NVIDIA L40; float32; acceptance 0.86
+mzIdentML,"JAX core, 1 GPU, best chain count",262144,1.18718e+09,6119,Engine; NVIDIA L40; float32; acceptance 0.91
+mzIdentML,"JAX template, 1 GPU, best chain count",131072,2.638e+09,1.36e+04,ManyMovers; NVIDIA L40; float32; acceptance 0.91
 NPC basket,C++ release,1,2351.81,1,score_moved on; IMP 20261103.develop.74ba496d88; check level 1
 NPC basket,C++ fast,1,2831.57,1.204,score_moved on; IMP 20261103.develop.74ba496d88; check level 0
-NPC basket,"JAX core, 1 CPU core",1,49154.5,20.9,Engine; cpu; float32; acceptance 0.16
-NPC basket,"JAX core, 1 GPU, 1 chain",1,7409.83,3.151,Engine; NVIDIA L40; float32; acceptance 0.16
-NPC basket,"JAX core, 1 GPU, best chain count",65536,2.05838e+07,8752,Engine; NVIDIA L40; float32; acceptance 0.38
+NPC basket,"JAX core, 1 CPU core",1,61549.8,26.17,Engine; cpu; float32; acceptance 0.16
+NPC basket,"JAX core, 1 GPU, 1 chain",1,8714.42,3.705,Engine; NVIDIA L40; float32; acceptance 0.16
+NPC basket,"JAX core, 1 GPU, best chain count",8192,5.43325e+07,2.31e+04,Engine; NVIDIA L40; float32; acceptance 0.38
+NPC basket,"JAX template, 1 GPU, best chain count",8192,7.5064e+07,3.192e+04,ManyMovers; NVIDIA L40; float32; acceptance 0.38
 mature NPC,C++ release,1,98.8534,1,score_moved off; IMP 20261103.develop.74ba496d88; check level 1
 mature NPC,C++ fast,1,193.442,1.957,score_moved off; IMP 20261103.develop.74ba496d88; check level 0
 mature NPC,"JAX core, 1 CPU core",1,0.409331,0.004141,CollectiveEngine; cpu; float32; acceptance 0.067
@@ -18,8 +21,8 @@ mature NPC,"JAX core, 1 GPU, best chain count",256,320.293,3.24,CollectiveEngine
 mature NPC,"JAX template, 1 GPU, best chain count",1024,1.03389e+06,1.046e+04,CollectiveNL; NVIDIA L40; float32; acceptance 0.0011
 Pol II,C++ release,1,19251.2,1,score_moved on; IMP 20261103.develop.74ba496d88; check level 1
 Pol II,C++ fast,1,22025.9,1.144,score_moved on; IMP 20261103.develop.74ba496d88; check level 0
-Pol II,"JAX core, 1 CPU core",1,158020,8.208,Engine; cpu; float32; acceptance 0.63
+Pol II,"JAX core, 1 CPU core",1,207188,10.76,Engine; cpu; float32; acceptance 0.63
 Pol II,"JAX template, 1 CPU core",1,396040,20.57,FewBodiesBeads; cpu; float32; acceptance 0.63
-Pol II,"JAX core, 1 GPU, 1 chain",1,12185.1,0.633,Engine; NVIDIA L40; float32; acceptance 0.63
-Pol II,"JAX core, 1 GPU, best chain count",65536,2.65285e+08,1.378e+04,Engine; NVIDIA L40; float32; acceptance 0.62
+Pol II,"JAX core, 1 GPU, 1 chain",1,13082,0.6795,Engine; NVIDIA L40; float32; acceptance 0.63
+Pol II,"JAX core, 1 GPU, best chain count",65536,3.1887e+08,1.656e+04,Engine; NVIDIA L40; float32; acceptance 0.62
 Pol II,"JAX template, 1 GPU, best chain count",32768,1.18082e+09,6.134e+04,FewBodiesBeads; NVIDIA L40; float32; acceptance 0.62

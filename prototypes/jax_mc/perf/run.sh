@@ -8,14 +8,13 @@
 # Run from prototypes/jax_mc. Both environments need JAX and the JAX_MC_*
 # system directories (jax_mc/sources.py); JAX runs use ENV_RELEASE (IMP only
 # builds the system there). Two streams run at the same time:
-#   CPU: C++ release, C++ fast, the JAX core engine with one chain and, for
-#        systems with a template, the template with one chain, one after
-#        the other, pinned to core CPU_CORE (single-threaded XLA);
+#   CPU: C++ release, C++ fast, the JAX core engine with one chain and the
+#        system's template with one chain, one after the other, pinned to
+#        core CPU_CORE (single-threaded XLA);
 #   GPU: JAX on GPU (CUDA device index): the core engine with one chain,
-#        then the system's sampler (its template, or the core) at growing
-#        chain counts (each in its own process, so running out of memory
-#        ends only that point), host threads on GPU_CORES; then, for systems
-#        with a template, the core engine at growing chain counts.
+#        then the system's template at growing chain counts (each in its
+#        own process, so running out of memory ends only that point), host
+#        threads on GPU_CORES; then the core engine at growing chain counts.
 # SYSTEMS and STREAMS (cpu, gpu, or core for only the core-engine part of
 # gpu) in the environment run a subset.
 # Results are appended to OUT/results.jsonl, logs to OUT/*.log; then
@@ -40,18 +39,22 @@ declare -A MODES=([mzid]=False,True [npc]=False,True [pm]=False
 declare -A BURN=([mzid]=0 [npc]=0 [pm]=20000 [polii]=0)
 declare -A SW1=([mzid]=20000 [npc]=100 [pm]=100 [polii]=2000)
 declare -A SWC=([mzid]=20000 [npc]=100 [pm]=3 [polii]=2000)
-declare -A SWT=([pm]=500 [polii]=2000)   # template, one chain on the CPU
+# template, one chain on the CPU (not the NPC basket: its unrolled sweep
+# didn't finish compiling on one core within 39 minutes)
+declare -A SWT=([mzid]=20000 [pm]=500 [polii]=2000)
 declare -A SWN=([mzid]=100 [npc]=20 [pm]=500 [polii]=200)
-declare -A MANY=([mzid]="65536 262144 524288 1048576"
-                 [npc]="8192 16384 32768 65536"
+declare -A MANY=([mzid]="32768 65536 131072 262144"
+                 [npc]="4096 8192 12288"
                  [pm]="512 1024 2048 4096"
                  [polii]="16384 32768 65536 131072")
-# the core engine where the system has a template: chain counts, sweeps
-# per call. The core runs without burn-in: Pol II's template has none
-# either, and the mature NPC's core engine rescores everything at every
-# step (all-pairs EV), so its speed doesn't depend on the state.
-declare -A CORE_MANY=([pm]="64 256 1024" [polii]="16384 32768 65536 131072")
-declare -A CORE_SW=([pm]=5 [polii]=200)
+# the core engine: chain counts, sweeps per call. The core runs without
+# burn-in: only the mature NPC's template has one, and its core engine
+# rescores everything at every step (all-pairs EV), so its speed doesn't
+# depend on the state.
+declare -A CORE_MANY=([mzid]="65536 262144 524288 1048576"
+                      [npc]="8192 12288 16384 32768 65536"
+                      [pm]="64 256 1024" [polii]="16384 32768 65536 131072")
+declare -A CORE_SW=([mzid]=100 [npc]=20 [pm]=5 [polii]=200)
 SYSTEMS=${SYSTEMS:-mzid npc pm polii}
 STREAMS=${STREAMS:-cpu gpu}
 

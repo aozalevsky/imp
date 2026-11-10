@@ -9,9 +9,13 @@ Specialization level:
 Preconditions (asserted):
   1. `s.mode == 'serial'` (SerialMover order).
   2. Number of movers is small enough to unroll (`len(s.movers) <= max_movers`,
-     default 128).
-  3. Every coordinate mover's rows `mv.rows` form a contiguous slice
-     `[row0, row0 + len(mv.rows))`.
+     default 128; compile time grows with the number of movers, see
+     `templates/many_movers`).
+
+A coordinate mover whose rows `mv.rows` form a contiguous slice
+`[row0, row0 + len(mv.rows))` gets the in-place update. Any other one (a
+TransformMover over several bodies and beads) takes the engine's own step
+for its group, with its tables as constants.
 """
 import numpy as np
 import jax
@@ -27,13 +31,12 @@ def check_preconditions(s, max_movers=128):
     assert 0 < len(s.movers) <= max_movers, (
         f'R2 requires 1..{max_movers} movers for unrolling, got '
         f'{len(s.movers)}')
-    for i, mv in enumerate(s.movers):
-        if mv.kind != 'normal':
-            r = np.asarray(mv.rows, np.int64)
-            assert len(r) > 0 and np.array_equal(
-                r, np.arange(r[0], r[0] + len(r))), (
-                f'R2 requires contiguous rows for mover {i} ({mv.kind}), '
-                f'got {r}')
+
+
+def contiguous(mv):
+    """do a coordinate mover's rows form one slice of X?"""
+    r = np.asarray(mv.rows, np.int64)
+    return len(r) > 0 and np.array_equal(r, np.arange(r[0], r[0] + len(r)))
 
 
 def barrier_slice(X, start, length, axis=1):
@@ -99,6 +102,10 @@ class UnrolledEngine(E.Engine):
                     core['nuis'], jnp.where(acc, xn, x)[None], k, axis=0)
                 return dict(core, nuis=nuis, E=E_new, cache=cache), acc
             return step
+
+        if not contiguous(mv_spec):
+            branch = self._branches[g]      # the engine's step, constant j
+            return lambda core, u, z, kT: branch(core, j, u, z, kT)
 
         rows = np.asarray(mv_spec.rows, np.int64)
         r0, nr = int(rows[0]), len(rows)

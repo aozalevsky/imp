@@ -12,8 +12,9 @@ beyond the cutoff may or may not count there, depending on the list's
 history (salilab/imp#1121). `extra` widens the cutoff here.
 
 For the incremental engine both terms cache their pair sums per chain
-(isd: MD, MM cross and the slope sum; bayesianem: the per-density MD sums
-and the slope sum) and update them with the moved Gaussians' change.
+(isd: MD, MM cross and the slope sum; bayesianem: every Gaussian's overlaps
+with the densities and their compensated sums) and update them with the
+moved Gaussians' change.
 """
 import math
 
@@ -79,6 +80,7 @@ def _data(m, pis):
 
 class _EM(Term):
     TAG = None
+    SPLIT = True
 
     @classmethod
     def claims(cls, d, s):
@@ -153,6 +155,12 @@ class _EM(Term):
         v = xm[:, :, None] - self.dx[:, None, :, None]
         d2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2]
         return xm, cm, ov, d2
+
+    def touched(self, rows):
+        """the mover's model Gaussians (at least 1 if it moves anything
+           else the term reads)"""
+        return max(int(np.isin(self.rows, rows).sum()),
+                   int(np.isin(self.rows_read, rows).any()))
 
     def move_tables(self, s, moves):
         """the mover's model Gaussians (a: index, aslot: slot), and per
@@ -345,12 +353,16 @@ class EMBayes(_EM):
     """bayesianem.GaussianEMRestraint (log-normal on per-density overlap
        ratios, with a sigma nuisance and a nearest-center slope term).
 
-       The per-density sums are kept as sums over blocks of BLOCK
-       consecutive model Gaussians, and a move recomputes the blocks it
-       touches from positions. Updating the sums by adding and subtracting
-       overlaps instead is not safe in float32: a density with no model
-       nearby has a sum near 0 next to single overlaps of order 10, and the
-       energy depends on log(sum + 1e-10)."""
+       For the incremental engine the cache keeps every model Gaussian's
+       overlaps with the densities (ov) and its slope distance (sd), and
+       their sums over the Gaussians as compensated sums (geom.xadd). A
+       move scores its own Gaussians only, at their new positions; what
+       they contributed before is read back from the cache. The sums can't
+       be plain running sums: a density with no model nearby has a sum
+       near 0 next to single overlaps of order 10, the energy depends on
+       log(sum + 1e-10), and in float32 the residue of adding and later
+       subtracting an overlap moved it by kT. full() sums from scratch, in
+       blocks of BLOCK Gaussians."""
     name = 'em_bayes'
     TAG = 'IMP.bayesianem.GaussianEMRestraint'
     BLOCK = 16
@@ -441,10 +453,10 @@ class EMBayes(_EM):
         return bs, bsl
 
     def _sums(self, st, masks=None):
-        """per-density MD sums sdm (D, C) and the slope sum sl (C,), with
-           their per-block parts. masks: (md (n, D, C), _) model x data pair
-           mask to use instead of the cutoff (from cpp_masks, for exact
-           checks; no blocks)"""
+        """per-density MD sums sdm (D, C) and the slope sum sl (C,), summed
+           in blocks. masks: (md (n, D, C), _) model x data pair mask to use
+           instead of the cutoff (from cpp_masks, for exact checks; no
+           blocks)"""
         if masks is not None:
             xm, cm, ov, d2 = self._md(st)
             sdm = jnp.sum(jnp.where(masks[0], ov, 0.), axis=0)
@@ -454,8 +466,7 @@ class EMBayes(_EM):
         qq = np.minimum(self.blk, len(self.rows) - 1)
         bs, bsl = self._blocks(self.blk, st['X'][:, self.rows[qq]],
                                self._covs(qq, st))
-        return dict(bs=bs, bsl=bsl, sdm=jnp.sum(bs, axis=0),
-                    sl=jnp.sum(bsl, axis=0))
+        return dict(sdm=jnp.sum(bs, axis=0), sl=jnp.sum(bsl, axis=0))
 
     def _energy(self, c, nuis):
         scale = nuis[self.sig]
@@ -470,55 +481,47 @@ class EMBayes(_EM):
         return self._energy(self._sums(st, masks), st['nuis'])
 
     def cache(self, st):
-        return self._sums(st)
+        q = np.arange(len(self.rows))
+        ov, sd = self._blocks(q[:, None], st['X'][:, self.rows][:, :, None],
+                              self._covs(q, st)[:, :, None])
+        k = geom.limbs(ov.dtype)
+        sdm, sl = geom.xsum(ov, k), geom.xsum(sd, k)
+        return dict(ov=ov, sd=sd, sdm=sdm[-1], sdm_x=jnp.stack(sdm[:-1]),
+                    sl=sl[-1], sl_x=jnp.stack(sl[:-1]))
 
     def move_tables(self, s, moves):
-        """blocks with a moved Gaussian (aff), the slots of their Gaussians
-           (bslot, -1: not moved), each block's place in aff (bmap, -1: not
-           touched), and per Gaussian its owner's slot among the mover's
-           bodies (mbslot)"""
+        """the mover's model Gaussians (a: index, aslot: slot) and, per
+           Gaussian, its owner's slot among the mover's bodies (mbslot)"""
         t = super().move_tables(s, moves)
-        nblk = len(self.blk)
-        ms = np.concatenate([t['mslot'], np.full((len(moves), 1), -1)], 1)
-        aff = [np.unique(np.nonzero(m[:-1] >= 0)[0] // self.BLOCK)
-               for m in ms]
-        aff = pad(aff, nblk)
-        bslot = np.stack([m[self.blk[np.minimum(a, nblk - 1)]]
-                          for m, a in zip(ms, aff)])
-        bslot[aff >= nblk] = -1
-        bmap = np.full((len(moves), nblk), -1, np.int64)
-        for i, a in enumerate(aff):
-            for k, b in enumerate(a):
-                if b < nblk:
-                    bmap[i, b] = k
-        return dict(aff=aff, bslot=bslot, bmap=bmap, mbslot=t['mbslot'])
+        return dict(a=t['a'], aslot=t['aslot'], mbslot=t['mbslot'])
 
     def delta(self, tab, st, cache, mv):
-        n, nblk = len(self.rows), len(self.blk)
-        aff = tab['aff']
-        q = jnp.asarray(self.blk)[jnp.minimum(aff, nblk - 1)]
-        q = jnp.where((aff < nblk)[:, None], q, n)          # (K, B)
-        qq = jnp.minimum(q, n - 1)
-        x = mv.pos(jnp.asarray(self.rows)[qq], tab['bslot'])
-        bs_n, bsl_n = self._blocks(q, x, self._covs(qq, st, mv,
-                                                    tab['mbslot']))
-        bm = tab['bmap']
-        hit, k = bm >= 0, jnp.maximum(bm, 0)
-        sdm = jnp.sum(jnp.where(hit[:, None, None], bs_n[k], cache['bs']),
-                      axis=0)
-        sl = jnp.sum(jnp.where(hit[:, None], bsl_n[k], cache['bsl']), axis=0)
-        new = dict(cache, sdm=sdm, sl=sl)
+        n = len(self.rows)
+        a = tab['a']                                        # (K,), n: none
+        aa = jnp.minimum(a, n - 1)
+        x = mv.Xn[:, tab['aslot']]
+        ov_n, sd_n = self._blocks(
+            a[:, None], x[:, :, None],
+            self._covs(aa, st, mv, tab['mbslot'])[:, :, None])
+        ok = a < n
+        ov_o = jnp.where(ok[:, None, None], cache['ov'][aa], 0.)
+        sd_o = jnp.where(ok[:, None], cache['sd'][aa], 0.)
+        sdm = [*cache['sdm_x'], cache['sdm']]
+        sl = [*cache['sl_x'], cache['sl']]
+        for k in range(a.shape[0]):
+            sdm = geom.xadd(geom.xadd(sdm, ov_n[k]), -ov_o[k])
+            sl = geom.xadd(geom.xadd(sl, sd_n[k]), -sd_o[k])
+        new = dict(sdm=sdm[-1], sdm_x=jnp.stack(sdm[:-1]), sl=sl[-1],
+                   sl_x=jnp.stack(sl[:-1]))
         dE = self._energy(new, st['nuis']) - self._energy(cache, st['nuis'])
 
         def commit(acc):
-            a = jnp.minimum(aff, nblk - 1)
-            return dict(
-                bs=cache['bs'].at[aff].set(jnp.where(
-                    acc, bs_n, cache['bs'][a]), mode='drop'),
-                bsl=cache['bsl'].at[aff].set(jnp.where(
-                    acc, bsl_n, cache['bsl'][a]), mode='drop'),
-                sdm=jnp.where(acc, sdm, cache['sdm']),
-                sl=jnp.where(acc, sl, cache['sl']))
+            out = {k: jnp.where(acc, v, cache[k]) for k, v in new.items()}
+            out['ov'] = cache['ov'].at[a].set(jnp.where(acc, ov_n, ov_o),
+                                              mode='drop')
+            out['sd'] = cache['sd'].at[a].set(jnp.where(acc, sd_n, sd_o),
+                                              mode='drop')
+            return out
         return dE, commit
 
     def delta_nuis(self, st, cache, nuis):

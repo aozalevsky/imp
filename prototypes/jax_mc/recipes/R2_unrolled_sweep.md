@@ -25,9 +25,13 @@ index scatter (`X.at[:, rows].set(...)`) with:
 ## Preconditions (enforced by `assert`)
 1. `s.mode == 'serial'` (`assert s.mode == 'serial'`).
 2. Few movers so compile time stays short (`assert 0 < len(s.movers) <= max_movers`,
-   49 movers in Pol II).
-3. Every coordinate mover moves a contiguous slice of rows
-   (`assert len(r) > 0 and np.array_equal(r, np.arange(r[0], r[0] + len(r)))`).
+   default 128; 49 movers in Pol II). `templates/many_movers` lifts the
+   limit and pays for it in compile time.
+
+A coordinate mover that moves a contiguous slice of rows gets the in-place
+update. Any other one (a `TransformMover` over several bodies and beads, as
+in the NPC basket) takes the engine's own step for its group, with its
+tables as constants (`contiguous(mv)`).
 
 ## Measured gain
 - **RNA Polymerase II (`polii`) on 1 NVIDIA L40 GPU (`float32`)**:
