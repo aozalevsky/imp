@@ -1,0 +1,18 @@
+{
+ "npc": {
+  "image": "model_npc.png",
+  "px_per_A": 0.998271534722609,
+  "mass_MDa": 36.29246064,
+  "diameter_A": 1201.3542224380262,
+  "chains": 496,
+  "beads": 32256
+ },
+ "basket": {
+  "image": "model_basket.png",
+  "px_per_A": 1.0158213891119503,
+  "mass_MDa": 15.60824736,
+  "diameter_A": 1293.213015234834,
+  "chains": 168,
+  "beads": 96672
+ }
+}

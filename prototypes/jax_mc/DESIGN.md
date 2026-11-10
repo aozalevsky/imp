@@ -1,11 +1,12 @@
 # jax_mc: a core plus recipes for fast, exact JAX Monte Carlo samplers
 
-Status, 2026-11-09: steps 1-4 are done (`system`, `terms`, `engine`,
+Status, 2026-11-10: steps 1-4 are done (`system`, `terms`, `engine`,
 `check`, `bench`, `run`, `rmf`; `templates/collective`, agy_imp's
 `templates/few_bodies_beads` with recipes R1-R7, and `templates/many_movers`),
 and step 5's guide (GUIDE.md) and test script (`tests/check_all.sh`). A speed
-pass over the core on 2026-11-09 is the last entry of
-[Progress](#progress). Left: cleaning up the old prototype directories.
+pass over the core (2026-11-09) and a node-against-node measurement
+(2026-11-10) are the last entries of [Progress](#progress). Left: cleaning
+up the old prototype directories.
 
 ## Why
 
@@ -822,3 +823,22 @@ against 942 k): unrolling is a GPU technique.
   remove about 8 of the 28 kernels of a bead move without unrolling.
 - Mature NPC: a neighbour-list EV in the core (the template's R8), and a
   cheaper list rebuild in the template (35% of its step).
+
+**One node against one node (2026-11-10): `perf/node.py`.** `speed.png`
+compares one core with one GPU; a node has 64 hardware threads and four
+GPUs. `perf/node.py` runs N processes at once and times them over one
+common window; `perf/node.sh` has the runs, `perf/node_results.jsonl` the
+records, and `perf/README.md` the details. MC steps/s, C++ fast build
+against the templates on four L40s:
+
+| system | 64 C++ processes | 4 GPUs | factor |
+|---|---|---|---|
+| NPC basket | 108,582 | 299.8 M | 2,761 |
+| mature NPC | 4,323 | 5.43 M | 1,256 |
+
+- Four GPUs do 4.0 times one (75.0 M and 1.36 M per L40). 64 C++ processes
+  do 41 and 24 times one thread; the mature NPC is bound by memory there.
+- The mature NPC template does 1.36 M per L40 over a 60 s window, against
+  1.03 M over the first 2,500 steps after burn-in (`speed.png`): fewer
+  accepted moves, fewer list rebuilds.
+- `perf/slide/` builds a slide from the records.

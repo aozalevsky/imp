@@ -1,0 +1,32 @@
+{
+ "title": "IMP speed-up on GPUs: preliminary results",
+ "subtitle": "Monte Carlo sampling on one node: C++ on 64 CPU threads vs JAX on 4 GPUs",
+ "footnote": "Same restraints and moves  ·  steps summed over all chains run in parallel  ·  AMD EPYC 7543P (64 threads), 4 NVIDIA L40 GPUs",
+ "cpu_processes": 64,
+ "cpu_label": "CPU node, 64 threads",
+ "gpu_processes": 4,
+ "gpu_label": "GPU node, 4 GPUs",
+ "scale_A": 500,
+ "systems": {
+  "basket": {
+   "record": "npc",
+   "title": "Nuclear basket of the yeast NPC",
+   "size": "per spoke: 39 rigid bodies, 309 beads",
+   "citation": [
+    "Model: Singh, Soni, et al, ",
+    "Cell",
+    ", 2024"
+   ]
+  },
+  "npc": {
+   "record": "pm",
+   "title": "Mature human NPC",
+   "size": "32,256 beads in 112 rigid bodies",
+   "citation": [
+    "Model: Latham et al, ",
+    "PNAS",
+    ", 2025"
+   ]
+  }
+ }
+}
